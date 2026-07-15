@@ -137,7 +137,8 @@
 - Docker/Testcontainers CI 容器环境
 - Playwright / axe-core / 安全扫描
 - OpenTelemetry / 监控
-- **Git 首次提交已完成**：`d0aecd5`（root-commit，93 文件 / 26,853 行；`Initial commit: OPC AI OS V1-A monorepo (M1-M3, E04-T01..T05)`）；含 M01–M07 迁移、E03/E04 实现、文档与 `pnpm-lock.yaml`。未推送远程（按需在用户许可后 `git push -u origin master`）。
+- **Git 首次提交已推送**：`6c5c219`（root-commit，92 文件 / 26,830 行；`Initial commit: OPC AI OS V1-A monorepo (M1-M3, E04-T01..T05)`）；CI 工作流 `.github/workflows/ci.yml` 经补充提交（含 `workflow` 作用域的 token）已纳入并推送至 `github.com/binaryxu1201-dotcom/opc-ai-os`。
+  - 注意：本次推送用的 `ghp_` classic token 曾在会话中明文提供，建议用完后到 GitHub 撤销/轮换该 token。
 - `CHECKPOINT.md` 已校正至 2026-07-15 状态，并随首次提交入库。
 
 ---
