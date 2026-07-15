@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1783992182368,
+      "tag": "0000_shallow_bulldozer",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1783993570642,
+      "tag": "0001_special_rage",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783994070257,
+      "tag": "0002_lumpy_lenny_balinger",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1783995558591,
+      "tag": "0003_silly_typhoid_mary",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1784005861560,
+      "tag": "0004_uneven_terror",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1784113200000,
+      "tag": "0005_ai_suggestion_decision_cascade",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784113300000,
+      "tag": "0006_allow_cascaded_ai_decision_deletion",
+      "breakpoints": true
+    }
+  ]
+}
