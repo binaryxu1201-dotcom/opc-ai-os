@@ -3,11 +3,11 @@ import type { Pool, PoolClient } from "pg";
 import { appendAuditEvent } from "../platform/audit.js";
 import { recordIdempotent, replayIdempotent, requireUpdatedRow, validateExpectedVersion } from "../platform/concurrency.js";
 import { ApiError } from "../platform/errors.js";
-import type { TaskPlanItem } from "./proposal.js";
+import type { DailyTop3Item, TaskPlanItem } from "./proposal.js";
 
 type Context = { userId: string; requestId: string; traceId: string };
 type SuggestionStatus = "GENERATED" | "WAITING_CONFIRMATION" | "CONFIRMED" | "REJECTED" | "EXPIRED" | "EXECUTION_FAILED";
-type SuggestionRow = { id: string; ai_run_id: string; workspace_id: string; suggestion_type: string; status: SuggestionStatus; proposed_payload: { items?: TaskPlanItem[] }; target_project_id: string | null; version: number; created_at: Date; updated_at: Date; confirmed_at: Date | null; rejected_at: Date | null };
+type SuggestionRow = { id: string; ai_run_id: string; workspace_id: string; suggestion_type: string; status: SuggestionStatus; proposed_payload: { items?: TaskPlanItem[] | DailyTop3Item[] }; target_project_id: string | null; version: number; created_at: Date; updated_at: Date; confirmed_at: Date | null; rejected_at: Date | null };
 
 type EditedItem = { itemKey: string; title?: string; description?: string | null; estimatedMinutes?: number | null; dueAt?: string | null };
 
@@ -28,8 +28,24 @@ async function suggestionById(connection: Pool | PoolClient, workspaceId: string
 }
 
 function taskPlan(suggestion: SuggestionRow): TaskPlanItem[] {
-  if (suggestion.suggestion_type !== "TASK_PLAN" || !suggestion.target_project_id || !Array.isArray(suggestion.proposed_payload.items)) throw new ApiError(409, "INVALID_STATE_TRANSITION", "该建议不支持任务确认。");
-  return suggestion.proposed_payload.items;
+  const items = suggestion.proposed_payload.items;
+  if (suggestion.suggestion_type !== "TASK_PLAN" || !suggestion.target_project_id || !Array.isArray(items) || !items.every(isTaskPlanItem)) throw new ApiError(409, "INVALID_STATE_TRANSITION", "该建议不支持任务确认。");
+  return items;
+}
+
+function isTaskPlanItem(item: TaskPlanItem | DailyTop3Item): item is TaskPlanItem {
+  return "itemKey" in item && "title" in item && typeof item.itemKey === "string" && typeof item.title === "string";
+}
+
+function isDailyTop3Item(item: TaskPlanItem | DailyTop3Item): item is DailyTop3Item {
+  return "taskId" in item && "rank" in item && "reason" in item && typeof item.taskId === "string" && Number.isInteger(item.rank) && typeof item.reason === "string";
+}
+
+function dailyTop3(suggestion: SuggestionRow): DailyTop3Item[] {
+  const items = suggestion.proposed_payload.items;
+  if (suggestion.suggestion_type !== "DAILY_TOP3" || !Array.isArray(items)) throw new ApiError(409, "INVALID_STATE_TRANSITION", "该建议不支持每日三件事确认。");
+  if (items.length < 1 || items.length > 3 || !items.every(isDailyTop3Item)) throw new ApiError(409, "INVALID_STATE_TRANSITION", "每日三件事建议内容无效。");
+  return items;
 }
 
 function normalizeItems(original: TaskPlanItem[], edited: EditedItem[] | undefined): TaskPlanItem[] {
@@ -85,6 +101,27 @@ export async function confirmSuggestion(suggestionId: string, input: { expectedV
     if (input.editedPayload) await client.query("INSERT INTO ai_suggestion_decision (id,suggestion_id,decision,actor_user_id,edited_payload) VALUES ($1,$2,'EDITED',$3,$4::jsonb)", [randomUUID(), suggestionId, context.userId, JSON.stringify({ items })]);
     await client.query("INSERT INTO ai_suggestion_decision (id,suggestion_id,decision,actor_user_id,edited_payload) VALUES ($1,$2,'CONFIRMED',$3,$4::jsonb)", [randomUUID(), suggestionId, context.userId, JSON.stringify({ items })]);
     const value = response(updated, createdResources); await appendAuditEvent(client, { eventId: randomUUID(), occurredAt: new Date(), actorType: "USER", actorId: context.userId, workspaceId: workspace, action: "AI_SUGGESTION_CONFIRMED", resourceType: "ai_suggestion", resourceId: suggestionId, afterSummary: { status: updated.status, taskCount: createdResources.length }, requestId: context.requestId, traceId: context.traceId, aiRunId: current.ai_run_id, result: "SUCCESS" }); await recordIdempotent(client, context, "ai.suggestion.confirm", key, idempotencyInput, suggestionId, value); await client.query("COMMIT"); return value;
+  } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
+}
+
+export async function confirmDailyTop3Suggestion(suggestionId: string, input: { expectedVersion: number; items: { taskId: string; rank: number }[] }, key: string, context: Context, pool: Pool) {
+  validateExpectedVersion(input.expectedVersion);
+  if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 3) throw new ApiError(422, "VALIDATION_FAILED", "每日三件事确认必须保留 1 至 3 项。");
+  const client = await pool.connect(); const idempotencyInput = { suggestionId, ...input };
+  try {
+    await client.query("BEGIN"); const replay = await replayIdempotent<ReturnType<typeof response>>(client, context, "dashboard.daily-top3.confirm", key, idempotencyInput); if (replay) { await client.query("COMMIT"); return replay; }
+    const workspace = await workspaceForWrite(client, context.userId); const current = await suggestionById(client, workspace, suggestionId); if (!current) throw new ApiError(404, "RESOURCE_NOT_FOUND", "当前工作空间中不存在该 AI 建议。"); transitionable(current.status);
+    const original = dailyTop3(current); const originalByTaskId = new Map(original.map((item) => [item.taskId, item])); const seen = new Set<string>();
+    const items: DailyTop3Item[] = input.items.map((item, index) => {
+      const source = originalByTaskId.get(item.taskId);
+      if (!source || seen.has(item.taskId) || item.rank !== index + 1) throw new ApiError(422, "VALIDATION_FAILED", "确认项必须是原建议的唯一连续排序子集。");
+      seen.add(item.taskId); return { taskId: source.taskId, rank: index + 1, reason: source.reason };
+    });
+    const validTasks = await client.query<{ id: string }>("SELECT t.id FROM task t JOIN project p ON p.id=t.project_id AND p.workspace_id=t.workspace_id WHERE t.workspace_id=$1 AND t.id=ANY($2::uuid[]) AND t.status IN ('DRAFT','CONFIRMED','IN_PROGRESS') AND p.status IN ('DRAFT','IN_PROGRESS','PAUSED')", [workspace, items.map((item) => item.taskId)]);
+    if (validTasks.rows.length !== items.length) throw new ApiError(409, "INVALID_STATE_TRANSITION", "建议中的任务已不适用于每日三件事确认。");
+    const update = await client.query<SuggestionRow>("UPDATE ai_suggestion SET status='CONFIRMED',confirmed_at=now(),version=version+1 WHERE id=$1 AND workspace_id=$2 AND version=$3 RETURNING *", [suggestionId, workspace, input.expectedVersion]); const updated = requireUpdatedRow(update.rows[0]);
+    await client.query("INSERT INTO ai_suggestion_decision (id,suggestion_id,decision,actor_user_id,edited_payload) VALUES ($1,$2,'CONFIRMED',$3,$4::jsonb)", [randomUUID(), suggestionId, context.userId, JSON.stringify({ items })]);
+    const value = response(updated); await appendAuditEvent(client, { eventId: randomUUID(), occurredAt: new Date(), actorType: "USER", actorId: context.userId, workspaceId: workspace, action: "DAILY_TOP3_CONFIRMED", resourceType: "ai_suggestion", resourceId: suggestionId, afterSummary: { status: updated.status, itemCount: items.length }, requestId: context.requestId, traceId: context.traceId, aiRunId: current.ai_run_id, result: "SUCCESS" }); await recordIdempotent(client, context, "dashboard.daily-top3.confirm", key, idempotencyInput, suggestionId, value); await client.query("COMMIT"); return value;
   } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
 }
 

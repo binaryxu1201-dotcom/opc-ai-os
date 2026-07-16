@@ -1,13 +1,13 @@
-# 工作检查点 — 2026-07-15（校正）
+# 工作检查点 — 2026-07-16
 
-## 总体状态：M1–M3 里程碑完成，E04 AI COO 受控链路过半
+## 总体状态：M1–M4 里程碑完成，进入数据权利与 Worker 阶段
 
 ```
 里程碑完成度：
 ▓▓▓▓▓▓▓▓▓▓ M1 数据与平台基础  ✅ (E01-T01~T09 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M2 账户与工作空间  ✅ (E02-T01~T07 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M3 手动经营闭环     ✅ (E03-T01~T06 全部完成)
-▓▓▓▓▓░░░░░░ M4 AI COO           🚧 (E04-T01~T05 完成；E04-T06/T07 待实施)
+▓▓▓▓▓▓▓▓▓▓ M4 AI COO           ✅ (E04-T01~T07 全部完成)
 ░░░░░░░░░░ M5 数据权利与Worker  📋 (未开始)
 ░░░░░░░░░░ M6 发布候选         📋 (未开始)
 ```
@@ -30,7 +30,7 @@
 
 > 注：`0005`/`0006` 刻意不使用 `CREATE OR REPLACE FUNCTION`，因此普通本地迁移账号（无 `public` schema `CREATE` 权限）也能直接 `pnpm db migrate` 成功应用。
 
-### API（项目、任务、进度与 CRM-lite、仪表盘、AI COO 已接入，37 个测试全部通过）
+### API（项目、任务、进度与 CRM-lite、仪表盘、AI COO 已接入，43 个测试全部通过）
 
 | 路由 | 功能 | 关键点 |
 |------|------|--------|
@@ -65,6 +65,7 @@
 | `POST /api/v1/customers/:customerId/actions/change-stage` | 变更客户阶段 | 严格转换矩阵、回退/重新激活原因、历史与审计同事务 |
 | `GET /api/v1/customers/:customerId/stage-history` | 阶段历史 | 只读 append-only 历史、游标分页 |
 | `GET /api/v1/dashboard/daily-top3` | 每日三件事（手动降级） | 当前空间活跃/暂停项目下的活跃任务只读 top-3；排除终态项目/任务；不改任务状态（E03-T05） |
+| `POST /api/v1/dashboard/daily-top3/actions/confirm` | 确认每日 AI 建议排序 | 仅确认原建议的 1–3 项连续排序子集；写决议/审计但不创建或修改任务（E04-T06） |
 | `POST /api/v1/ai/runs` | 创建 AI Run | 受控上下文 + 供应商适配器调用，事务外调用，持久化脱敏快照（E04-T03） |
 | `GET /api/v1/ai/runs/:runId` | AI Run 详情 | 仅当前空间，跨空间 404 |
 | `GET /api/v1/ai/runs/:runId/events` | AI Run SSE 事件流 | 仅安全事件；支持 `Last-Event-ID` 断线恢复（E04-T03） |
@@ -81,13 +82,15 @@
 - **审计客户端**: 仅调用 `append_audit_event()`, 不走直接 DML
 - **幂等/乐观锁**: `apps/api/src/platform/concurrency.ts` 统一 `replayIdempotent` / `recordIdempotent` / `validateExpectedVersion` / `requireUpdatedRow`，project/task/customer 服务已复用（E03-T06）
 
-### AI COO 受控链路（E04-T01~T05）
+### AI COO 受控链路（E04-T01~T07）
 
 - **T01 供应商适配器** `apps/api/src/ai/provider.ts`：`AiProviderAdapter` 默认 15s 超时、最多 2 次调用、5 分钟窗口失败率熔断、默认 60s 熔断打开；稳定错误码 `AI_TIMEOUT` / `AI_PROVIDER_UNAVAILABLE` / `AI_CIRCUIT_OPEN`；`MockAiProvider` 用于确定性测试。
 - **T02 受控上下文** `apps/api/src/ai/context.ts`：服务端从认证 `userId` 派生 workspace；要求 `AI_BUSINESS_DATA=GRANTED`；仅查当前空间；`TASK_BREAKDOWN` 跨空间返回 404；Prompt 分为 system instruction / system structured context / user instruction；脱敏（客户别名 `客户-A`、删除 `customer.notes` 与 `task.description`、文本截断、邮箱/电话替换为 `[REDACTED]`）；生成 `dataCategories` / `consentEvidence` / `inputRedactionMethod`。
 - **T03 AI Run / SSE** `apps/api/src/ai/run.ts`：持久化 `ai_run`（先写 `PROCESSING` + 脱敏快照），事务外调用 T01 适配器，落 `GENERATED` / `FAILED` / `TIMED_OUT`；`replayIdempotent` 处理 `ai.run.create` 幂等；SSE 仅发安全事件且支持 `Last-Event-ID`。
 - **T04 提案/状态机** `apps/api/src/ai/proposal.ts`：`parseProposal()` 解析 `TASK_PLAN`（1–50 项、服务端稳定 `itemKey`）、`CLARIFYING_QUESTION`、连续两次无效 JSON/Schema 后 `NATURAL_LANGUAGE_FALLBACK`；run 据类型流转 `GENERATED` / `WAITING_FOR_INPUT` / `DEGRADED` 并持久化 `ai_suggestion`；确认前不创建 task 行。
 - **T05 建议事务** `apps/api/src/ai/suggestion.ts`：编辑/确认/驳回三动作；原提案不可变；`editedPayload` 必须过同一 Schema；客户端不可改/增/复用 `itemKey`；确认事务原子创建 `AI_CONFIRMED` 任务 + 终态决议 + 审计，失败回滚；`(source_ai_suggestion_id, source_ai_item_key)` 防止重复写入；`EXECUTION_FAILED` 终态不可重确认。
+- **T06 每日三件事 AI 建议与配额**：`DAILY_TOP3` 仅接受最多 3 项 `{taskId,rank,reason}`；`ai_usage_daily` 以 UTC 日期、空间与能力原子计数，每日 3 次配额，超额返回 `429 AI_QUOTA_CAPABILITY_EXHAUSTED` 与 `Retry-After`；仪表盘仅展示请求日期内有效的 AI 建议，否则回退 E03-T05 手动 top-3；确认只记录用户选择的原项子集/连续排序、决议、审计和幂等响应，绝不创建或改变任务。
+- **T07 AI 质量、安全与成本测试集**：版本化 `ai-evaluation-v1` 合成样本与说明文档；任务拆解 100、每日三件事 50、低质量输入 20、Prompt 注入 30、脱敏 30，均有稳定样本 ID 与确定性可重跑断言；注入验证用户输入隔离于 system/context 分区，脱敏验证客户别名、备注/任务描述/邮箱/电话不进入模型上下文；E04-T06 集成用例验证 `ai_usage_daily` 的配额、成功/失败计数与 token 累计。
 
 ### 测试验证
 
@@ -95,7 +98,7 @@
 |------|------|
 | `pnpm.cmd typecheck` | ✅ 6 个工作空间 |
 | `pnpm.cmd lint` | ✅ |
-| `pnpm.cmd test` | ✅ 14 文件 / 37 用例 |
+| `pnpm.cmd test` | ✅ 15 文件 / 43 用例 |
 | `pnpm.cmd build` | ✅ web + api + contracts + config + worker |
 | `GET /health` → 200 | ✅ |
 | `GET /ready` → 200 (db+redis ok) | ✅ |
@@ -113,14 +116,14 @@
 | M1 数据与平台基础 | E01-T01~T09 | ✅ 全部完成 |
 | M2 账户与工作空间 | E02-T01~T07 | ✅ 全部完成 |
 | M3 手动经营闭环 | E03-T01~T06（含每日三件事手动降级、幂等/乐观锁通用用例） | ✅ 全部完成 |
-| E04 AI COO（部分） | E04-T01 适配器 / T02 受控上下文 / T03 Run·SSE / T04 提案状态机 / T05 建议事务 | ✅ T01~T05 完成 |
+| E04 AI COO | E04-T01 适配器 / T02 受控上下文 / T03 Run·SSE / T04 提案状态机 / T05 建议事务 / T06 每日三件事 AI 建议与配额 / T07 质量安全成本测试集 | ✅ T01~T07 全部完成 |
 
 ### 下一阶段：M4 AI COO（收尾）
 
 | ID | 内容 | 依赖 | 状态 |
 |----|------|------|------|
-| E04-T06 | 每日三件事 AI 建议与配额 | E04-T04、E03-T05 | ⬜ 待实施：复用 T05 确认事务；新增 `DAILY_TOP3` 建议类型；最多 3 项；配额 `429`；无建议降级到 E03-T05 手动 top-3 |
-| E04-T07 | AI 质量、安全、成本测试集 | E04-T04~T06 | ⬜ 待实施：任务拆解 ≥100、每日三件事 ≥50、注入 ≥30、脱敏 ≥30；版本化可重跑 |
+| E04-T06 | 每日三件事 AI 建议与配额 | E04-T04、E03-T05 | ✅ 已完成：`DAILY_TOP3` 最多 3 项；`ai_usage_daily` 原子 UTC 日配额与 `429`；当日 AI 建议或 E03-T05 手动降级；确认仅记录排序、不修改任务 |
+| E04-T07 | AI 质量、安全、成本测试集 | E04-T04~T06 | ✅ 已完成：版本化 `ai-evaluation-v1`，任务拆解 100、每日三件事 50、低质量输入 20、注入 30、脱敏 30；确定性可重跑，配额/token 成本投影由真实数据库集成测试覆盖 |
 
 ### 后续 Epic
 
@@ -160,4 +163,4 @@
 
 ## 下次开工入口
 
-从 **E04-T06** 开始：基于已完成的 E04-T04（提案/运行）、E04-T05（建议确认/驳回事务）与 E03-T05（手动 top-3），实现**每日三件事 AI 建议与配额**。新增 `DAILY_TOP3` 类型建议，复用 `ai_suggestion` / `confirm` / `reject` 事务；配额计数复用 `ai_usage_daily`（已在 `0002` 建表）；超配额返回 `429`；无 AI 建议时降级到 E03-T05 手动 top-3，确认不修改任务状态。入口建议放在 `apps/api/src/ai/` 下扩展 proposal/suggestion 服务，并在 `app.ts` 注册对应路由。
+从 **E05-T01** 开始：实现数据导出申请、CSV 生成和一次性下载。复用 `export_job`、`export_download_token`、`async_job` 与审计设计；仅导出当前空间基础经营数据，令牌不得进入 URL/日志，消费后重放返回 `409`，文件保留 7 天。

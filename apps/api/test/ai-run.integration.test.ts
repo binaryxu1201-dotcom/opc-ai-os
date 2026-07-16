@@ -13,6 +13,9 @@ import { RedisSlidingWindowRateLimiter } from "../src/platform/rate-limiter.js";
 import { buildApp } from "../src/app.js";
 import { SignJWT } from "jose";
 import { confirmSuggestion, editSuggestion, rejectSuggestion } from "../src/ai/suggestion.js";
+import { confirmDailyTop3Suggestion } from "../src/ai/suggestion.js";
+import { getDailyTop3 } from "../src/dashboard/service.js";
+import { DAILY_TOP3_DAILY_QUOTA } from "../src/ai/run.js";
 
 const environment = loadEnvironment();
 const pool = new Pool({ connectionString: environment.DATABASE_URL });
@@ -34,16 +37,27 @@ async function fixture(suffix: string) {
 
 async function cleanup(userIds: string[]): Promise<void> {
   for (const userId of userIds) {
-    await pool.query("DELETE FROM task WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
-    await pool.query("DELETE FROM ai_suggestion WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
-    await pool.query("DELETE FROM ai_run WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
-    await pool.query("DELETE FROM project WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
-    await pool.query("DELETE FROM idempotency_record WHERE actor_user_id=$1", [userId]);
-    await pool.query("DELETE FROM consent WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
-    await pool.query("DELETE FROM workspace WHERE owner_user_id=$1", [userId]);
-    await pool.query("DELETE FROM session WHERE user_id=$1", [userId]);
-    await pool.query("DELETE FROM credential WHERE user_id=$1", [userId]);
-    await pool.query("DELETE FROM app_user WHERE id=$1", [userId]);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("ALTER TABLE ai_suggestion_decision DISABLE TRIGGER ai_suggestion_decision_append_only");
+      await client.query("DELETE FROM task WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
+      await client.query("DELETE FROM ai_suggestion WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
+      await client.query("DELETE FROM ai_run WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
+      await client.query("DELETE FROM ai_usage_daily WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
+      await client.query("DELETE FROM project WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
+      await client.query("DELETE FROM idempotency_record WHERE actor_user_id=$1", [userId]);
+      await client.query("DELETE FROM consent WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [userId]);
+      await client.query("DELETE FROM workspace WHERE owner_user_id=$1", [userId]);
+      await client.query("DELETE FROM session WHERE user_id=$1", [userId]);
+      await client.query("DELETE FROM credential WHERE user_id=$1", [userId]);
+      await client.query("DELETE FROM app_user WHERE id=$1", [userId]);
+      await client.query("ALTER TABLE ai_suggestion_decision ENABLE TRIGGER ai_suggestion_decision_append_only");
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally { client.release(); }
   }
 }
 
@@ -148,6 +162,39 @@ describe("AI run integration", () => {
       expect(rejected.status).toBe("REJECTED");
       expect((await pool.query("SELECT count(*)::int AS count FROM task WHERE source_ai_suggestion_id=$1", [rejectedSuggestion.id])).rows[0]?.count).toBe(0);
     } finally { if (userIds.length > 0) await cleanup(userIds); }
+  });
+
+  it("creates a max-three daily recommendation, records quota, falls back safely, and confirms ordering without task writes", async () => {
+    const suffix = randomUUID(); const userIds: string[] = [];
+    try {
+      const account = await fixture(`daily-${suffix}`); userIds.push(account.user.id);
+      const taskIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+      for (const [index, taskId] of taskIds.entries()) {
+        await pool.query("INSERT INTO task (id,workspace_id,project_id,depth,title,assignee_user_id,status,created_by_user_id,updated_by_user_id) VALUES ($1,$2,$3,1,$4,$5,'CONFIRMED',$5,$5)", [taskId, account.workspace.id, account.project.id, `Daily task ${index + 1}`, account.user.id]);
+      }
+      const content = JSON.stringify({ items: taskIds.slice(0, 3).map((taskId, index) => ({ taskId, rank: index + 1, reason: `Reason ${index + 1}` })) });
+      const deps = { pool, provider: new AiProviderAdapter(new MockAiProvider(async () => ({ content, modelVersion: "mock-v1", inputTokens: 5, outputTokens: 7 }))), model: "mock-v1", providerKey: "mock", promptVersion: "v1" };
+      const firstRun = await createAiRun({ capability: "DAILY_TOP3" }, `ai-daily-first-${suffix}`, account.context, deps);
+      expect(firstRun.status).toBe("GENERATED");
+      const suggestion = (await pool.query<{ id: string; version: number; proposed_payload: { items: { taskId: string; rank: number; reason: string }[] } }>("SELECT id,version,proposed_payload FROM ai_suggestion WHERE ai_run_id=$1", [firstRun.id])).rows[0];
+      if (!suggestion) throw new Error("Daily suggestion missing");
+      expect(suggestion.proposed_payload.items).toHaveLength(3);
+      const before = await pool.query<{ id: string; status: string; version: number }>("SELECT id,status,version FROM task WHERE workspace_id=$1 ORDER BY id", [account.workspace.id]);
+      const dashboard = await getDailyTop3({}, account.context, { pool });
+      expect(dashboard).toMatchObject({ source: "AI_DAILY_TOP3", suggestion: { id: suggestion.id, version: suggestion.version } });
+      expect(dashboard.items.map((item) => item.taskId)).toEqual(taskIds.slice(0, 3));
+      const confirmed = await confirmDailyTop3Suggestion(suggestion.id, { expectedVersion: suggestion.version, items: [{ taskId: taskIds[1]!, rank: 1 }, { taskId: taskIds[0]!, rank: 2 }] }, `daily-confirm-${suffix}`, account.context, pool);
+      const after = await pool.query<{ id: string; status: string; version: number }>("SELECT id,status,version FROM task WHERE workspace_id=$1 ORDER BY id", [account.workspace.id]);
+      expect(confirmed).toMatchObject({ status: "CONFIRMED", createdResources: [] });
+      expect(before.rows).toEqual(after.rows);
+      const decision = await pool.query<{ decision: string; edited_payload: { items: { taskId: string; rank: number }[] } }>("SELECT decision,edited_payload FROM ai_suggestion_decision WHERE suggestion_id=$1", [suggestion.id]);
+      expect(decision.rows).toMatchObject([{ decision: "CONFIRMED", edited_payload: { items: [{ taskId: taskIds[1], rank: 1 }, { taskId: taskIds[0], rank: 2 }] } }]);
+      await expect(confirmDailyTop3Suggestion(suggestion.id, { expectedVersion: confirmed.version, items: [{ taskId: taskIds[0]!, rank: 1 }] }, `daily-confirm-again-${suffix}`, account.context, pool)).rejects.toMatchObject({ statusCode: 409, code: "INVALID_STATE_TRANSITION" });
+      for (let attempt = 2; attempt <= DAILY_TOP3_DAILY_QUOTA; attempt += 1) await createAiRun({ capability: "DAILY_TOP3" }, `ai-daily-${attempt}-${suffix}`, { ...account.context, traceId: randomUUID() }, deps);
+      await expect(createAiRun({ capability: "DAILY_TOP3" }, `ai-daily-over-quota-${suffix}`, { ...account.context, traceId: randomUUID() }, deps)).rejects.toMatchObject({ statusCode: 429, code: "AI_QUOTA_CAPABILITY_EXHAUSTED" });
+      const usage = await pool.query<{ request_count: number; success_count: number; failure_count: number; input_tokens: string; output_tokens: string }>("SELECT request_count,success_count,failure_count,input_tokens,output_tokens FROM ai_usage_daily WHERE workspace_id=$1 AND usage_date=(now() AT TIME ZONE 'UTC')::date AND capability='DAILY_TOP3'", [account.workspace.id]);
+      expect(usage.rows).toEqual([{ request_count: DAILY_TOP3_DAILY_QUOTA, success_count: DAILY_TOP3_DAILY_QUOTA, failure_count: 0, input_tokens: "15", output_tokens: "21" }]);
+    } finally { await cleanup(userIds); }
   });
 
   it("serves a safe authenticated SSE lifecycle and Last-Event-ID recovery", async () => {

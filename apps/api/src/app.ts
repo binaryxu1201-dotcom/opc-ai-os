@@ -21,7 +21,7 @@ import { changeCustomerStage, createCustomer, getCustomer, listCustomers, listCu
 import { getDailyTop3 } from "./dashboard/service.js";
 import { AiProviderAdapter, MockAiProvider } from "./ai/provider.js";
 import { aiRunEvents, createAiRun, getAiRun } from "./ai/run.js";
-import { confirmSuggestion, editSuggestion, rejectSuggestion } from "./ai/suggestion.js";
+import { confirmDailyTop3Suggestion, confirmSuggestion, editSuggestion, rejectSuggestion } from "./ai/suggestion.js";
 
 export interface ReadinessDependencies {
   checkDatabase: () => Promise<boolean>;
@@ -96,7 +96,7 @@ export function buildApp(environment: Environment, dependencies = createReadines
   const workspaceDependencies = { pool: registrationDependencies.pool };
   const aiDependencies = {
     pool: registrationDependencies.pool,
-    provider: new AiProviderAdapter(new MockAiProvider(async () => ({ content: "{\"tasks\":[{\"title\":\"Review current priorities\"}]}", modelVersion: "mock-v1", inputTokens: 0, outputTokens: 0 }))),
+    provider: new AiProviderAdapter(new MockAiProvider(async (request) => ({ content: request.messages[0]?.content.includes("daily-priority") ? "{\"items\":[]}" : "{\"tasks\":[{\"title\":\"Review current priorities\"}]}" , modelVersion: "mock-v1", inputTokens: 0, outputTokens: 0 }))),
     model: "mock-v1",
     providerKey: "mock",
     promptVersion: "v1"
@@ -160,6 +160,7 @@ export function buildApp(environment: Environment, dependencies = createReadines
   app.post<{ Params: { customerId: string }; Body: { toStage: string; reason?: string; expectedVersion: number } }>("/api/v1/customers/:customerId/actions/change-stage", async (request) => ({ data: await changeCustomerStage(request.params.customerId, request.body, idempotencyKey(request), await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
   app.get<{ Params: { customerId: string }; Querystring: { limit?: string; cursor?: string } }>("/api/v1/customers/:customerId/stage-history", async (request) => { const result = await listCustomerStageHistory(request.params.customerId, { limit: request.query.limit === undefined ? undefined : Number(request.query.limit), cursor: request.query.cursor }, await authContext(request), workspaceDependencies); return { data: result.history, meta: { nextCursor: result.nextCursor, hasMore: result.hasMore, requestId: request.id } }; });
   app.get<{ Querystring: { date?: string } }>("/api/v1/dashboard/daily-top3", async (request) => ({ data: await getDailyTop3(request.query.date === undefined ? {} : { date: request.query.date }, await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
+  app.post<{ Body: { suggestionId: string; expectedVersion: number; items: { taskId: string; rank: number }[] } }>("/api/v1/dashboard/daily-top3/actions/confirm", async (request) => ({ data: await confirmDailyTop3Suggestion(request.body.suggestionId, { expectedVersion: request.body.expectedVersion, items: request.body.items }, idempotencyKey(request), await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }));
   app.post<{ Body: { capability: "TASK_BREAKDOWN" | "DAILY_TOP3"; projectId?: string; input?: { instruction?: string } } }>("/api/v1/ai/runs", async (request, reply) => {
     if (!request.headers.accept?.includes("text/event-stream")) throw new ApiError(422, "VALIDATION_FAILED", "AI 请求必须接受 text/event-stream 响应。");
     const run = await createAiRun({ capability: request.body.capability, ...(request.body.projectId === undefined ? {} : { projectId: request.body.projectId }), ...(request.body.input?.instruction === undefined ? {} : { instruction: request.body.input.instruction }) }, idempotencyKey(request), await authContext(request), aiDependencies);

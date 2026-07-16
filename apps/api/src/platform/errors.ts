@@ -12,6 +12,10 @@ export class ApiError extends Error {
 }
 
 function sendError(error: ApiError, request: FastifyRequest, reply: FastifyReply): void {
+  if (error.statusCode === 429) {
+    const retryAfterSeconds = error.details?.[0]?.retryAfterSeconds;
+    if (typeof retryAfterSeconds === "number" && Number.isInteger(retryAfterSeconds) && retryAfterSeconds > 0) reply.header("retry-after", String(retryAfterSeconds));
+  }
   reply.code(error.statusCode).send({
     error: {
       code: error.code,

@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 
 export type TaskPlanItem = { itemKey: string; title: string; description: string | null; estimatedMinutes: number | null; dueAt: string | null };
+export type DailyTop3Item = { taskId: string; rank: number; reason: string };
 export type Proposal =
   | { kind: "TASK_PLAN"; payload: { items: TaskPlanItem[] } }
+  | { kind: "DAILY_TOP3"; payload: { items: DailyTop3Item[] } }
   | { kind: "CLARIFYING_QUESTION"; payload: { question: string } }
   | { kind: "NATURAL_LANGUAGE_FALLBACK"; payload: { message: string } };
 
@@ -29,12 +31,30 @@ function parseTaskPlan(value: unknown): Proposal | undefined {
   return { kind: "TASK_PLAN", payload: { items } };
 }
 
-export function parseProposal(content: string): Proposal | undefined {
+function parseDailyTop3(value: unknown): Proposal | undefined {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { items?: unknown }).items)) return undefined;
+  const entries = (value as { items: unknown[] }).items;
+  if (entries.length < 1 || entries.length > 3) return undefined;
+  const items: DailyTop3Item[] = [];
+  const taskIds = new Set<string>();
+  for (const [index, entry] of entries.entries()) {
+    if (!entry || typeof entry !== "object") return undefined;
+    const record = entry as { taskId?: unknown; rank?: unknown; reason?: unknown };
+    const taskId = text(record.taskId, 64);
+    const reason = text(record.reason, 500);
+    if (!taskId || !reason || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId) || record.rank !== index + 1 || taskIds.has(taskId)) return undefined;
+    taskIds.add(taskId);
+    items.push({ taskId, rank: index + 1, reason });
+  }
+  return { kind: "DAILY_TOP3", payload: { items } };
+}
+
+export function parseProposal(content: string, capability: "TASK_BREAKDOWN" | "DAILY_TOP3"): Proposal | undefined {
   try {
     const parsed: unknown = JSON.parse(content);
     const clarification = parsed && typeof parsed === "object" ? text((parsed as { clarificationQuestion?: unknown }).clarificationQuestion, 1_000) : undefined;
     if (clarification) return { kind: "CLARIFYING_QUESTION", payload: { question: clarification } };
-    return parseTaskPlan(parsed);
+    return capability === "TASK_BREAKDOWN" ? parseTaskPlan(parsed) : parseDailyTop3(parsed);
   } catch { return undefined; }
 }
 

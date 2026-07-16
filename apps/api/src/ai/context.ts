@@ -6,7 +6,7 @@ type Capability = "TASK_BREAKDOWN" | "DAILY_TOP3";
 type Context = { userId: string };
 
 type ProjectRow = { id: string; name: string; objective: string; deliverable: string | null; status: string };
-type TaskRow = { title: string; status: string; due_at: Date | null; estimated_minutes: number | null };
+type TaskRow = { id: string; title: string; status: string; due_at: Date | null; estimated_minutes: number | null };
 type CustomerRow = { name: string; stage: string; intent_level: string; next_action: string | null };
 type ProfileRow = { skills: unknown; entrepreneur_stage: string; business_goal: string };
 
@@ -69,7 +69,7 @@ export async function buildAiContext(input: AiContextInput, context: Context, po
   if (input.capability === "TASK_BREAKDOWN" && !projects.rows[0]) throw new ApiError(404, "RESOURCE_NOT_FOUND", "当前工作空间中不存在该项目。");
 
   const projectIds = projects.rows.map((project) => project.id);
-  const tasks = projectIds.length === 0 ? [] : (await pool.query<TaskRow>("SELECT title,status,due_at,estimated_minutes FROM task WHERE workspace_id=$1 AND project_id=ANY($2::uuid[]) ORDER BY due_at ASC NULLS LAST,created_at ASC", [workspace.id, projectIds])).rows;
+  const tasks = projectIds.length === 0 ? [] : (await pool.query<TaskRow>("SELECT id,title,status,due_at,estimated_minutes FROM task WHERE workspace_id=$1 AND project_id=ANY($2::uuid[]) ORDER BY due_at ASC NULLS LAST,created_at ASC", [workspace.id, projectIds])).rows;
   const customers = input.capability === "DAILY_TOP3"
     ? (await pool.query<CustomerRow>("SELECT name,stage,intent_level,next_action FROM customer WHERE workspace_id=$1 ORDER BY updated_at DESC,id DESC", [workspace.id])).rows
     : [];
@@ -86,7 +86,7 @@ export async function buildAiContext(input: AiContextInput, context: Context, po
       businessGoal: truncate(profileRow.business_goal, 1_000)
     },
     projects: projects.rows.map((project) => ({ name: truncate(project.name, 160), objective: truncate(project.objective, 2_000), deliverable: truncate(project.deliverable, 2_000), status: project.status })),
-    tasks: tasks.map((task) => ({ title: truncate(task.title, 200), status: task.status, dueAt: task.due_at?.toISOString() ?? null, estimatedMinutes: task.estimated_minutes })),
+    tasks: tasks.map((task) => ({ id: task.id, title: truncate(task.title, 200), status: task.status, dueAt: task.due_at?.toISOString() ?? null, estimatedMinutes: task.estimated_minutes })),
     customers: customerContext
   };
   const dataCategories: AiContextSnapshot["dataCategories"] = [
