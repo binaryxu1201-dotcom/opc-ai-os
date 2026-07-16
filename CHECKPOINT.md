@@ -8,7 +8,7 @@
 ▓▓▓▓▓▓▓▓▓▓ M2 账户与工作空间  ✅ (E02-T01~T07 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M3 手动经营闭环     ✅ (E03-T01~T06 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M4 AI COO           ✅ (E04-T01~T07 全部完成)
-▓▓▓▓▓▓▓▓░░ M5 数据权利与Worker  🚧 (E05-T01~T03 完成；E05-T04 待特权部署)
+ ▓▓▓▓▓▓▓▓▓▓ M5 数据权利与Worker  ✅ (E05-T01~T04 全部完成)
 ░░░░░░░░░░ M6 发布候选         📋 (未开始)
 ```
 
@@ -108,7 +108,7 @@
 - **Worker 可靠性**：`EXPORT_GENERATE` 以 `FOR UPDATE SKIP LOCKED` 领取作业，`RUNNING→SUCCEEDED` 成功收敛；失败安全记录为 `RETRY_SCHEDULED`，第三次失败进入 `DEAD_LETTER` 与 export `FAILED`，仅记录稳定失败码。
 - **T02 到期导出清理**：Worker 每轮扫描已到期的 `READY`/`DOWNLOADED` 导出，幂等创建 `EXPORT_CLEANUP`；清理任务以 `SKIP LOCKED` 领取，先删除私有对象，再同事务撤销未消费令牌、清空 object key、置 `EXPIRED`、完成作业并追加 Worker 审计。对象删除失败不会提前改变导出状态，作业按最多 3 次重试后进入 `DEAD_LETTER`。
 - **T03 注销与宽限期**：注销申请/撤销均要求当前 Session 15 分钟内重认证，且都具备事务幂等和审计；申请同时置用户 `DEACTIVATION_GRACE`、空间 `READ_ONLY`、撤销其他会话并安排 `DEACTIVATION_FINALIZE`。全局 API 守卫拒绝只读空间的非认证/导出/注销写入；最终 Worker 在宽限期届满且无 retention hold 时锁定任务，禁用凭据、撤销会话、匿名化账号/画像/项目/任务/客户字段，置空间/用户/请求为 `TOMBSTONED`，失败最多重试 3 次后死信。
-- **T04 Worker 可观测性与审计分区维护**：用户仅可读取当前 workspace 的 `async_job` 状态、积压计数与 `failure_code`/`failure_detail_safe`；系统维护任务使用 `workspace_id=NULL + resource_type=system`，迁移约束阻止将其伪造为业务空间任务。Worker 按 UTC 月幂等排程并消费 `AUDIT_PARTITION_MAINTAIN`，失败安全重试/死信。审计分区 DDL 通过 `db/privileged/0007_audit_partition_maintenance.sql` 的 `audit_owner` 专用 `SECURITY DEFINER` 函数执行；普通应用迁移账号被刻意拒绝该权限，需由受控部署流程执行脚本后 Worker 才能成功维护分区。
+- **T04 Worker 可观测性与审计分区维护**：用户仅可读取当前 workspace 的 `async_job` 状态、积压计数与 `failure_code`/`failure_detail_safe`；系统维护任务使用 `workspace_id=NULL + resource_type=system`，迁移约束阻止将其伪造为业务空间任务。Worker 按 UTC 月幂等排程并消费 `AUDIT_PARTITION_MAINTAIN`，失败安全重试/死信。审计分区 DDL 通过 `db/privileged/0007_audit_partition_maintenance.sql` 的 `audit_owner` 专用 `SECURITY DEFINER` 函数执行；普通应用迁移账号被刻意拒绝该权限，需由受控部署流程执行脚本后 Worker 才能成功维护分区。已以 `audit_owner` 角色完成部署：`maintain_audit_partitions()` 创建并预建 2026-07 至 2027-07 共 13 个 `audit_event` 分区，`AUDIT_PARTITION_MAINTAIN` Worker 任务可收敛为 `SUCCEEDED`。
 
 ### 测试验证
 
@@ -145,7 +145,7 @@
 | E05-T01 | 数据导出、CSV 与一次性下载 | M04 表结构、审计 | ✅ 已完成：S3/MinIO 私有对象存储、`EXPORT_GENERATE` Worker、7 天过期、一次性 hash token、`POST` body 受控下载、重放 `409`、CSV 公式注入防护与集成测试 |
 | E05-T02 | 到期导出对象清理 | E05-T01 | ✅ 已完成：`EXPORT_CLEANUP` 幂等扫描/领取、私有对象删除、未消费 token 撤销、`EXPIRED` 状态与 Worker 审计；失败最多重试 3 次后死信；集成测试覆盖对象删除与重复执行 |
 | E05-T03 | 注销宽限期与匿名化 | E05-T01、会话重认证 | ✅ 已完成：当前 Session 重认证、`GRACE`/`READ_ONLY` 冻结、其他会话撤销、幂等撤销恢复、API 写入守卫与 `DEACTIVATION_FINALIZE` 匿名化 Worker；真实数据库测试覆盖会话隔离与冻结恢复 |
-| E05-T04 | Worker 可观测性与审计分区维护 | E05-T01~T03、M05 审计表 | 🚧 代码/普通迁移已完成：当前空间任务列表/积压摘要/安全死信信息、系统 job scope 与 Worker 月度调度；待受控 `audit_owner` 部署 `db/privileged/0007_audit_partition_maintenance.sql` 后完成分区 DDL 激活 |
+| E05-T04 | Worker 可观测性与审计分区维护 | E05-T01~T03、M05 审计表 | ✅ 已完成：当前空间任务列表/积压摘要/安全死信信息、系统 job scope 与 Worker 月度调度；`audit_owner` 已部署 `db/privileged/0007_audit_partition_maintenance.sql`，`maintain_audit_partitions()` 预建 2026-07~2027-07 共 13 个分区，`AUDIT_PARTITION_MAINTAIN` Worker 收敛为 `SUCCEEDED` |
 
 ### 后续 Epic
 
@@ -185,4 +185,7 @@
 
 ## 下次开工入口
 
-从 **E05-T04 特权部署** 开始：由 `audit_owner` 受控部署角色执行 `db/privileged/0007_audit_partition_maintenance.sql`；验证 `maintain_audit_partitions()` 创建未来 12 个月分区及 `AUDIT_PARTITION_MAINTAIN` Worker 作业成功收敛。随后继续 E05 后续任务。
+**M5 已完成**（E05-T01~T04 全部交付并通过验证，含 `audit_owner` 特权部署审计分区函数）。下一步进入 **M6 发布候选** 与 **E06 Web PWA**：
+- M6：E2E、安全扫描、性能验证、发布证据（参考 `docs/07-V1-A测试与发布计划.md` 与跨阶段遗留项：10 万条审计事件预发性能验证、Docker/Testcontainers CI、Playwright/axe-core、OpenTelemetry 监控）。
+- E06：React 全部前端页面（依赖 E02~E05 已完成的后端契约）。
+- 跨阶段遗留项中的「审计分区维护 Worker + 13 个月热数据归档策略」已随 E05-T04 落地；其余遗留项归入 M6/M7 收尾。
