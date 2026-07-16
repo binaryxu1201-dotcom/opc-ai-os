@@ -1,30 +1,67 @@
+import { createHash, randomUUID } from "node:crypto";
+import { DeleteObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { loadEnvironment } from "@opc/config";
-import { Queue } from "bullmq";
+import { Pool } from "pg";
 
 const environment = loadEnvironment();
-const redisUrl = new URL(environment.REDIS_URL);
-const connection = {
-  host: redisUrl.hostname,
-  port: Number(redisUrl.port || "6379"),
-  maxRetriesPerRequest: null,
-  ...(redisUrl.username ? { username: decodeURIComponent(redisUrl.username) } : {}),
-  ...(redisUrl.password ? { password: decodeURIComponent(redisUrl.password) } : {})
-};
-const scaffoldQueue = new Queue("opc-scaffold", { connection });
+if (!environment.EXPORT_S3_ENDPOINT || !environment.EXPORT_S3_ACCESS_KEY_ID || !environment.EXPORT_S3_SECRET_ACCESS_KEY) throw new Error("Export S3 storage is not configured.");
+const pool = new Pool({ connectionString: environment.DATABASE_URL });
+const storage = new S3Client({ endpoint: environment.EXPORT_S3_ENDPOINT, forcePathStyle: true, region: environment.EXPORT_S3_REGION, credentials: { accessKeyId: environment.EXPORT_S3_ACCESS_KEY_ID, secretAccessKey: environment.EXPORT_S3_SECRET_ACCESS_KEY } });
+let timer: NodeJS.Timeout | undefined;
 
-async function start(): Promise<void> {
-  await scaffoldQueue.waitUntilReady();
-  console.info(JSON.stringify({ service: "worker", status: "ready" }));
+function csvCell(value: unknown): string { const raw = value === null || value === undefined ? "" : String(value); const safe = /^[=+\-@]/.test(raw) ? `'${raw}` : raw; return `"${safe.replaceAll('"', '""')}"`; }
+async function processExport(): Promise<void> {
+  const client = await pool.connect();
+  let job: { job_id: string; workspace_id: string; attempt_count: number; max_attempts: number } | undefined;
+  try {
+    await client.query("BEGIN");
+    const claim = await client.query<{ job_id: string; workspace_id: string; attempt_count: number; max_attempts: number }>("SELECT resource_id AS job_id,workspace_id,attempt_count,max_attempts FROM async_job WHERE job_type='EXPORT_GENERATE' AND status IN ('QUEUED','RETRY_SCHEDULED') AND run_after<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1");
+    job = claim.rows[0];
+    if (!job) { await client.query("COMMIT"); return; }
+    await client.query("UPDATE async_job SET status='RUNNING',locked_at=now(),attempt_count=attempt_count+1 WHERE resource_id=$1 AND job_type='EXPORT_GENERATE'", [job.job_id]);
+    await client.query("UPDATE export_job SET status='GENERATING',snapshot_at=COALESCE(snapshot_at,now()) WHERE id=$1 AND status='QUEUED'", [job.job_id]);
+    await client.query("COMMIT");
+    const projects = await client.query("SELECT id,name,objective,status,created_at,updated_at FROM project WHERE workspace_id=$1 ORDER BY created_at", [job.workspace_id]);
+    const tasks = await client.query("SELECT id,project_id,title,description,status,due_at,created_at,updated_at FROM task WHERE workspace_id=$1 ORDER BY created_at", [job.workspace_id]);
+    const customers = await client.query("SELECT id,name,source,intent_level,stage,next_action,notes,created_at,updated_at FROM customer WHERE workspace_id=$1 ORDER BY created_at", [job.workspace_id]);
+    const lines = ["record_type,id,project_id,name,objective,description,status,source,intent_level,stage,next_action,notes,due_at,created_at,updated_at", ...projects.rows.map(r => ["project",r.id,"",r.name,r.objective,"",r.status,"","","","","","",r.created_at,r.updated_at].map(csvCell).join(",")), ...tasks.rows.map(r => ["task",r.id,r.project_id,r.title,"",r.description ?? "",r.status,"","","","","",r.due_at ?? "",r.created_at,r.updated_at].map(csvCell).join(",")), ...customers.rows.map(r => ["customer",r.id,"",r.name,"","","",r.source,r.intent_level,r.stage,r.next_action ?? "",r.notes ?? "","",r.created_at,r.updated_at].map(csvCell).join(","))];
+    const content = Buffer.from(`\uFEFF${lines.join("\r\n")}\r\n`, "utf8"); const key = `exports/${job.workspace_id}/${job.job_id}.csv`;
+    await storage.send(new PutObjectCommand({ Bucket: environment.EXPORT_S3_BUCKET, Key: key, Body: content, ContentType: "text/csv; charset=utf-8" }));
+    await client.query("BEGIN");
+    await client.query("UPDATE export_job SET status='READY',object_key=$2,checksum_sha256=$3,size_bytes=$4,expires_at=now()+interval '7 days',version=version+1 WHERE id=$1", [job.job_id, key, createHash("sha256").update(content).digest("hex"), content.length]);
+    await client.query("UPDATE async_job SET status='SUCCEEDED',finished_at=now() WHERE resource_id=$1 AND job_type='EXPORT_GENERATE'", [job.job_id]);
+    await client.query("SELECT append_audit_event($1::uuid,now(),'WORKER',NULL,$2::uuid,'EXPORT_READY','EXPORT_JOB',$3::uuid,'{}'::jsonb,$4::jsonb,false,NULL,NULL,NULL,'SUCCESS',NULL)", [randomUUID(), job.workspace_id, job.job_id, JSON.stringify({ status: "READY", sizeBytes: content.length })]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    if (!job) throw error;
+    const recovery = await pool.connect();
+    try {
+      await recovery.query("BEGIN");
+      const state = await recovery.query<{ workspace_id: string; attempt_count: number; max_attempts: number }>("SELECT workspace_id,attempt_count,max_attempts FROM async_job WHERE resource_id=$1 AND job_type='EXPORT_GENERATE' FOR UPDATE", [job?.job_id]);
+      const current = state.rows[0];
+      if (current) {
+        const terminal = current.attempt_count >= current.max_attempts;
+        await recovery.query("UPDATE async_job SET status=$2,failure_code='EXPORT_GENERATE_FAILED',failure_detail_safe='Export generation failed.',run_after=now()+interval '1 minute',finished_at=CASE WHEN $2='DEAD_LETTER' THEN now() ELSE NULL END WHERE resource_id=$1 AND job_type='EXPORT_GENERATE'", [job!.job_id, terminal ? "DEAD_LETTER" : "RETRY_SCHEDULED"]);
+        if (terminal) {
+          await recovery.query("UPDATE export_job SET status='FAILED',failure_code='EXPORT_GENERATE_FAILED',version=version+1 WHERE id=$1", [job!.job_id]);
+          await recovery.query("SELECT append_audit_event($1::uuid,now(),'WORKER',NULL,$2::uuid,'EXPORT_FAILED','EXPORT_JOB',$3::uuid,'{}'::jsonb,$4::jsonb,false,NULL,NULL,NULL,'FAILED','EXPORT_GENERATE_FAILED')", [randomUUID(), current.workspace_id, job!.job_id, JSON.stringify({ status: "FAILED" })]);
+        }
+      }
+      await recovery.query("COMMIT");
+    } catch (recoveryError) {
+      await recovery.query("ROLLBACK").catch(() => undefined);
+      throw recoveryError;
+    } finally { recovery.release(); }
+    console.error(JSON.stringify({ service: "worker", jobType: "EXPORT_GENERATE", error: String(error) }));
+  } finally { client.release(); }
 }
-
-async function stop(): Promise<void> {
-  await scaffoldQueue.close();
-}
-
-process.once("SIGINT", () => void stop());
-process.once("SIGTERM", () => void stop());
-void start().catch(async (error: unknown) => {
-  console.error(JSON.stringify({ service: "worker", status: "failed", error: String(error) }));
-  await stop();
-  process.exitCode = 1;
-});
+async function enqueueCleanup(): Promise<void> { await pool.query("INSERT INTO async_job (id,job_type,status,resource_type,resource_id,workspace_id,idempotency_key) SELECT gen_random_uuid(),'EXPORT_CLEANUP','QUEUED','export_job',id,workspace_id,'export-cleanup:' || id::text FROM export_job WHERE status IN ('READY','DOWNLOADED') AND expires_at<=now() ON CONFLICT (idempotency_key) DO NOTHING"); }
+async function enqueueAuditPartitionMaintenance(): Promise<void> { await pool.query("INSERT INTO async_job (id,job_type,status,resource_type,resource_id,workspace_id,idempotency_key) VALUES (gen_random_uuid(),'AUDIT_PARTITION_MAINTAIN','QUEUED','system',gen_random_uuid(),NULL,'audit-partition:' || to_char(now() AT TIME ZONE 'UTC','YYYY-MM')) ON CONFLICT (idempotency_key) DO NOTHING"); }
+async function processCleanup(): Promise<void> { const client = await pool.connect(); let job: { resource_id: string; workspace_id: string } | undefined; try { await client.query("BEGIN"); const claimed = await client.query<{ resource_id: string; workspace_id: string }>("SELECT resource_id,workspace_id FROM async_job WHERE job_type='EXPORT_CLEANUP' AND status IN ('QUEUED','RETRY_SCHEDULED') AND run_after<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"); job = claimed.rows[0]; if (!job) { await client.query("COMMIT"); return; } await client.query("UPDATE async_job SET status='RUNNING',locked_at=now(),attempt_count=attempt_count+1 WHERE resource_id=$1 AND job_type='EXPORT_CLEANUP'", [job.resource_id]); const found = await client.query<{ status: string; object_key: string | null; expires_at: Date | null }>("SELECT status,object_key,expires_at FROM export_job WHERE id=$1 FOR UPDATE", [job.resource_id]); const exportJob = found.rows[0]; if (!exportJob || exportJob.status === 'EXPIRED') { await client.query("UPDATE async_job SET status='SUCCEEDED',finished_at=now() WHERE resource_id=$1 AND job_type='EXPORT_CLEANUP'", [job.resource_id]); await client.query("COMMIT"); return; } if (!exportJob.expires_at || exportJob.expires_at > new Date() || !['READY','DOWNLOADED'].includes(exportJob.status)) throw new Error('Export is not eligible for cleanup.'); await client.query("COMMIT"); if (exportJob.object_key) await storage.send(new DeleteObjectCommand({ Bucket: environment.EXPORT_S3_BUCKET, Key: exportJob.object_key })); await client.query("BEGIN"); await client.query("UPDATE export_download_token SET revoked_at=COALESCE(revoked_at,now()) WHERE export_job_id=$1 AND consumed_at IS NULL", [job.resource_id]); await client.query("UPDATE export_job SET status='EXPIRED',object_key=NULL,version=version+1 WHERE id=$1 AND status IN ('READY','DOWNLOADED')", [job.resource_id]); await client.query("UPDATE async_job SET status='SUCCEEDED',finished_at=now() WHERE resource_id=$1 AND job_type='EXPORT_CLEANUP'", [job.resource_id]); await client.query("SELECT append_audit_event($1::uuid,now(),'WORKER',NULL,$2::uuid,'EXPORT_EXPIRED','EXPORT_JOB',$3::uuid,'{}'::jsonb,$4::jsonb,false,NULL,NULL,NULL,'SUCCESS',NULL)", [randomUUID(), job.workspace_id, job.resource_id, JSON.stringify({ status: 'EXPIRED' })]); await client.query("COMMIT"); } catch (error) { await client.query("ROLLBACK").catch(() => undefined); if (job) await pool.query("UPDATE async_job SET status=CASE WHEN attempt_count>=max_attempts THEN 'DEAD_LETTER' ELSE 'RETRY_SCHEDULED' END,failure_code='EXPORT_CLEANUP_FAILED',failure_detail_safe='Export cleanup failed.',run_after=now()+interval '1 minute',finished_at=CASE WHEN attempt_count>=max_attempts THEN now() ELSE NULL END WHERE resource_id=$1 AND job_type='EXPORT_CLEANUP'", [job.resource_id]); else throw error; } finally { client.release(); } }
+async function processDeactivationFinalize(): Promise<void> { const client = await pool.connect(); let job: { resource_id: string; workspace_id: string } | undefined; try { await client.query("BEGIN"); const claimed = await client.query<{ resource_id: string; workspace_id: string }>("SELECT resource_id,workspace_id FROM async_job WHERE job_type='DEACTIVATION_FINALIZE' AND status IN ('QUEUED','RETRY_SCHEDULED') AND run_after<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"); job = claimed.rows[0]; if (!job) { await client.query("COMMIT"); return; } await client.query("UPDATE async_job SET status='RUNNING',locked_at=now(),attempt_count=attempt_count+1 WHERE resource_id=$1 AND job_type='DEACTIVATION_FINALIZE'", [job.resource_id]); const request = await client.query<{ user_id: string; status: string; grace_ends_at: Date; retention_hold: boolean }>("SELECT user_id,status,grace_ends_at,retention_hold FROM deactivation_request WHERE id=$1 AND workspace_id=$2 FOR UPDATE", [job.resource_id, job.workspace_id]); const record = request.rows[0]; if (!record || record.status === 'REVOKED' || record.status === 'TOMBSTONED') { await client.query("UPDATE async_job SET status='CANCELLED',finished_at=now() WHERE resource_id=$1 AND job_type='DEACTIVATION_FINALIZE'", [job.resource_id]); await client.query("COMMIT"); return; } if (record.status !== 'GRACE' || record.retention_hold || record.grace_ends_at > new Date()) { await client.query("UPDATE async_job SET status='RETRY_SCHEDULED',run_after=$2 WHERE resource_id=$1 AND job_type='DEACTIVATION_FINALIZE'", [job.resource_id, record.grace_ends_at]); await client.query("COMMIT"); return; } await client.query("UPDATE deactivation_request SET status='TOMBSTONING',version=version+1 WHERE id=$1", [job.resource_id]); await client.query("UPDATE credential SET status='DISABLED' WHERE user_id=$1", [record.user_id]); await client.query("UPDATE session SET revoked_at=COALESCE(revoked_at,now()),revoke_reason=COALESCE(revoke_reason,'DEACTIVATED') WHERE user_id=$1", [record.user_id]); await client.query("UPDATE profile SET skills='[]'::jsonb,entrepreneur_stage='TOMBSTONED',business_goal='TOMBSTONED',completed_at=NULL,version=version+1 WHERE workspace_id=$1", [job.workspace_id]); await client.query("UPDATE project SET name='TOMBSTONED',objective='TOMBSTONED',deliverable=NULL,version=version+1 WHERE workspace_id=$1", [job.workspace_id]); await client.query("UPDATE task SET title='TOMBSTONED',description=NULL,version=version+1 WHERE workspace_id=$1", [job.workspace_id]); await client.query("UPDATE customer SET name='TOMBSTONED',next_action=NULL,notes=NULL,version=version+1 WHERE workspace_id=$1", [job.workspace_id]); await client.query("UPDATE app_user SET email=$2,phone_e164=NULL,display_name=NULL,status='TOMBSTONED',tombstoned_at=now(),version=version+1,metadata='{}'::jsonb WHERE id=$1", [record.user_id, `tombstoned-${record.user_id}@invalid.local`]); await client.query("UPDATE workspace SET name='TOMBSTONED',description=NULL,status='TOMBSTONED',version=version+1 WHERE id=$1", [job.workspace_id]); await client.query("UPDATE deactivation_request SET status='TOMBSTONED',tombstoned_at=now(),tombstone_summary=$2::jsonb,version=version+1 WHERE id=$1", [job.resource_id, JSON.stringify({ status: 'TOMBSTONED' })]); await client.query("UPDATE async_job SET status='SUCCEEDED',finished_at=now() WHERE resource_id=$1 AND job_type='DEACTIVATION_FINALIZE'", [job.resource_id]); await client.query("SELECT append_audit_event($1::uuid,now(),'WORKER',NULL,$2::uuid,'DEACTIVATION_TOMBSTONED','DEACTIVATION_REQUEST',$3::uuid,'{}'::jsonb,$4::jsonb,false,NULL,NULL,NULL,'SUCCESS',NULL)", [randomUUID(), job.workspace_id, job.resource_id, JSON.stringify({ status: 'TOMBSTONED' })]); await client.query("COMMIT"); } catch (error) { await client.query("ROLLBACK").catch(() => undefined); if (job) await pool.query("UPDATE async_job SET status=CASE WHEN attempt_count>=max_attempts THEN 'DEAD_LETTER' ELSE 'RETRY_SCHEDULED' END,failure_code='DEACTIVATION_FINALIZE_FAILED',failure_detail_safe='Deactivation finalization failed.',run_after=now()+interval '1 minute',finished_at=CASE WHEN attempt_count>=max_attempts THEN now() ELSE NULL END WHERE resource_id=$1 AND job_type='DEACTIVATION_FINALIZE'", [job.resource_id]); else throw error; } finally { client.release(); } }
+async function processAuditPartitionMaintenance(): Promise<void> { const client = await pool.connect(); let jobId: string | undefined; try { await client.query("BEGIN"); const claimed = await client.query<{ id: string }>("SELECT id FROM async_job WHERE job_type='AUDIT_PARTITION_MAINTAIN' AND workspace_id IS NULL AND status IN ('QUEUED','RETRY_SCHEDULED') AND run_after<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"); jobId = claimed.rows[0]?.id; if (!jobId) { await client.query("COMMIT"); return; } await client.query("UPDATE async_job SET status='RUNNING',locked_at=now(),attempt_count=attempt_count+1 WHERE id=$1", [jobId]); await client.query("COMMIT"); await client.query("SELECT public.maintain_audit_partitions()"); await client.query("UPDATE async_job SET status='SUCCEEDED',finished_at=now(),failure_code=NULL,failure_detail_safe=NULL WHERE id=$1", [jobId]); } catch (error) { await client.query("ROLLBACK").catch(() => undefined); if (jobId) await pool.query("UPDATE async_job SET status=CASE WHEN attempt_count>=max_attempts THEN 'DEAD_LETTER' ELSE 'RETRY_SCHEDULED' END,failure_code='AUDIT_PARTITION_MAINTENANCE_FAILED',failure_detail_safe='Audit partition maintenance failed.',run_after=now()+interval '5 minutes',finished_at=CASE WHEN attempt_count>=max_attempts THEN now() ELSE NULL END WHERE id=$1", [jobId]); else throw error; } finally { client.release(); } }
+async function tick(): Promise<void> { await enqueueCleanup(); await enqueueAuditPartitionMaintenance(); await processExport(); await processCleanup(); await processDeactivationFinalize(); await processAuditPartitionMaintenance(); }
+async function start(): Promise<void> { await pool.query("SELECT 1"); timer = setInterval(() => void tick().catch((error: unknown) => console.error(JSON.stringify({ service: "worker", error: String(error) }))), 1000); await tick(); console.info(JSON.stringify({ service: "worker", status: "ready" })); }
+async function stop(): Promise<void> { if (timer) clearInterval(timer); await pool.end(); }
+process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop()); void start().catch(async (error: unknown) => { console.error(JSON.stringify({ service: "worker", status: "failed", error: String(error) })); await stop(); process.exitCode = 1; });

@@ -12,7 +12,12 @@ const environmentSchema = z.object({
   WEB_ORIGIN: z.string().url(),
   ACCESS_TOKEN_SECRET: z.string().min(32),
   ACCESS_TOKEN_ISSUER: z.string().min(1).default("opc-ai-os"),
-  ACCESS_TOKEN_AUDIENCE: z.string().min(1).default("opc-web")
+  ACCESS_TOKEN_AUDIENCE: z.string().min(1).default("opc-web"),
+  EXPORT_S3_ENDPOINT: z.string().url().optional(),
+  EXPORT_S3_REGION: z.string().min(1).default("us-east-1"),
+  EXPORT_S3_BUCKET: z.string().min(3).max(63).default("opc-exports"),
+  EXPORT_S3_ACCESS_KEY_ID: z.string().min(1).optional(),
+  EXPORT_S3_SECRET_ACCESS_KEY: z.string().min(1).optional()
 });
 
 export type Environment = z.infer<typeof environmentSchema>;

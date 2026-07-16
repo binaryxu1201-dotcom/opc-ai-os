@@ -22,6 +22,10 @@ import { getDailyTop3 } from "./dashboard/service.js";
 import { AiProviderAdapter, MockAiProvider } from "./ai/provider.js";
 import { aiRunEvents, createAiRun, getAiRun } from "./ai/run.js";
 import { confirmDailyTop3Suggestion, confirmSuggestion, editSuggestion, rejectSuggestion } from "./ai/suggestion.js";
+import { S3ExportStorage } from "./export/storage.js";
+import { downloadExport, getExport, issueDownloadToken, listExports, requestExport } from "./export/service.js";
+import { getDeactivation, requestDeactivation, revokeDeactivation } from "./deactivation/service.js";
+import { getAsyncJobSummary, listAsyncJobs } from "./platform/async-jobs.js";
 
 export interface ReadinessDependencies {
   checkDatabase: () => Promise<boolean>;
@@ -94,6 +98,8 @@ export function buildApp(environment: Environment, dependencies = createReadines
   const registrationDependencies: RegistrationDependencies = registration ?? ownedRegistrationDependencies!;
   const authenticationDependencies: AuthenticationDependencies = { ...registrationDependencies, environment };
   const workspaceDependencies = { pool: registrationDependencies.pool };
+  const exportStorage = environment.EXPORT_S3_ENDPOINT && environment.EXPORT_S3_ACCESS_KEY_ID && environment.EXPORT_S3_SECRET_ACCESS_KEY ? new S3ExportStorage(environment.EXPORT_S3_BUCKET, environment) : undefined;
+  const exportDependencies = exportStorage ? { pool: registrationDependencies.pool, storage: exportStorage } : undefined;
   const aiDependencies = {
     pool: registrationDependencies.pool,
     provider: new AiProviderAdapter(new MockAiProvider(async (request) => ({ content: request.messages[0]?.content.includes("daily-priority") ? "{\"items\":[]}" : "{\"tasks\":[{\"title\":\"Review current priorities\"}]}" , modelVersion: "mock-v1", inputTokens: 0, outputTokens: 0 }))),
@@ -102,6 +108,8 @@ export function buildApp(environment: Environment, dependencies = createReadines
     promptVersion: "v1"
   };
   const authContext = async (request: FastifyRequest) => { const token = request.headers.authorization?.startsWith("Bearer ") ? request.headers.authorization.slice(7) : undefined; if (!token) throw new ApiError(401, "UNAUTHENTICATED", "请先登录。"); const claims = await verifyAccessToken(token, environment); return { userId: claims.userId, sessionId: claims.sessionId, requestId: request.id, traceId: request.traceId }; };
+  app.addHook("preHandler", async (request) => { if (!new Set(["POST", "PUT", "PATCH", "DELETE"]).has(request.method) || request.url.startsWith("/api/v1/auth/") || request.url.startsWith("/api/v1/exports") || request.url === "/api/v1/deactivation-requests" || request.url === "/api/v1/deactivation-request/actions/revoke") return; const token = request.headers.authorization?.startsWith("Bearer ") ? request.headers.authorization.slice(7) : undefined; if (!token) return; const claims = await verifyAccessToken(token, environment); const state = await registrationDependencies.pool.query<{ status: string }>("SELECT status FROM workspace WHERE owner_user_id=$1", [claims.userId]); if (state.rows[0]?.status === "READ_ONLY") throw new ApiError(409, "WORKSPACE_READ_ONLY", "注销宽限期内仅允许读取、导出或撤销注销。"); });
+  const exportsEnabled = () => { if (!exportDependencies) throw new ApiError(503, "EXPORT_STORAGE_UNAVAILABLE", "导出存储尚未配置。"); return exportDependencies; };
   app.addHook("onClose", async () => { if (ownedRegistrationDependencies) await ownedRegistrationDependencies.close(); });
   app.post<{ Body: { email?: string; phone?: string; password: string; termsVersion: string; privacyVersion: string } }>("/api/v1/auth/register", async (request, reply) => {
     const user = await registerUser(request.body, request.ip, request.id, request.traceId, registrationDependencies);
@@ -159,6 +167,16 @@ export function buildApp(environment: Environment, dependencies = createReadines
   app.patch<{ Params: { customerId: string }; Body: { name?: string; source?: string; intentLevel?: "LOW" | "MEDIUM" | "HIGH"; nextAction?: string | null; notes?: string | null; expectedVersion: number } }>("/api/v1/customers/:customerId", async (request) => ({ data: await updateCustomer(request.params.customerId, request.body, idempotencyKey(request), await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
   app.post<{ Params: { customerId: string }; Body: { toStage: string; reason?: string; expectedVersion: number } }>("/api/v1/customers/:customerId/actions/change-stage", async (request) => ({ data: await changeCustomerStage(request.params.customerId, request.body, idempotencyKey(request), await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
   app.get<{ Params: { customerId: string }; Querystring: { limit?: string; cursor?: string } }>("/api/v1/customers/:customerId/stage-history", async (request) => { const result = await listCustomerStageHistory(request.params.customerId, { limit: request.query.limit === undefined ? undefined : Number(request.query.limit), cursor: request.query.cursor }, await authContext(request), workspaceDependencies); return { data: result.history, meta: { nextCursor: result.nextCursor, hasMore: result.hasMore, requestId: request.id } }; });
+  app.post<{ Body: { format: "CSV"; scope: "CORE_BUSINESS_DATA" } }>("/api/v1/exports", async (request, reply) => reply.code(202).send({ data: await requestExport(request.body, idempotencyKey(request), await authContext(request), exportsEnabled()), meta: { requestId: request.id } }));
+  app.get("/api/v1/exports", async (request) => ({ data: await listExports(await authContext(request), exportsEnabled()), meta: { requestId: request.id } }));
+  app.get<{ Params: { exportId: string } }>("/api/v1/exports/:exportId", async (request) => ({ data: await getExport(request.params.exportId, await authContext(request), exportsEnabled()), meta: { requestId: request.id } }));
+  app.post<{ Params: { exportId: string }; Body: { expectedVersion: number } }>("/api/v1/exports/:exportId/download-token", async (request) => ({ data: await issueDownloadToken(request.params.exportId, request.body.expectedVersion, await authContext(request), exportsEnabled()), meta: { requestId: request.id } }));
+  app.post<{ Params: { exportId: string }; Body: { token: string } }>("/api/v1/exports/:exportId/download", async (request, reply) => { const result = await downloadExport(request.params.exportId, request.body.token, await authContext(request), exportsEnabled()); return reply.header("content-type", "text/csv; charset=utf-8").header("content-disposition", `attachment; filename="${result.filename}"`).header("cache-control", "no-store").header("referrer-policy", "no-referrer").send(result.content); });
+  app.post<{ Body: { reason?: string } }>("/api/v1/deactivation-requests", async (request, reply) => reply.code(202).send({ data: await requestDeactivation(request.body, idempotencyKey(request), await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
+  app.get("/api/v1/deactivation-request", async (request) => ({ data: await getDeactivation(await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
+  app.post<{ Body: { expectedVersion: number } }>("/api/v1/deactivation-request/actions/revoke", async (request) => ({ data: await revokeDeactivation(request.body.expectedVersion, idempotencyKey(request), await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
+  app.get<{ Querystring: { status?: string | string[]; limit?: string } }>("/api/v1/async-jobs", async (request) => { const status = request.query.status === undefined ? undefined : Array.isArray(request.query.status) ? request.query.status : [request.query.status]; const input = { ...(status === undefined ? {} : { status }), ...(request.query.limit === undefined ? {} : { limit: Number(request.query.limit) }) }; return { data: await listAsyncJobs(input, await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }; });
+  app.get("/api/v1/async-jobs/summary", async (request) => ({ data: await getAsyncJobSummary(await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }));
   app.get<{ Querystring: { date?: string } }>("/api/v1/dashboard/daily-top3", async (request) => ({ data: await getDailyTop3(request.query.date === undefined ? {} : { date: request.query.date }, await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
   app.post<{ Body: { suggestionId: string; expectedVersion: number; items: { taskId: string; rank: number }[] } }>("/api/v1/dashboard/daily-top3/actions/confirm", async (request) => ({ data: await confirmDailyTop3Suggestion(request.body.suggestionId, { expectedVersion: request.body.expectedVersion, items: request.body.items }, idempotencyKey(request), await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }));
   app.post<{ Body: { capability: "TASK_BREAKDOWN" | "DAILY_TOP3"; projectId?: string; input?: { instruction?: string } } }>("/api/v1/ai/runs", async (request, reply) => {

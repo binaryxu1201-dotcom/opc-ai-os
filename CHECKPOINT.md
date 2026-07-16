@@ -1,6 +1,6 @@
 # 工作检查点 — 2026-07-16
 
-## 总体状态：M1–M4 里程碑完成，进入数据权利与 Worker 阶段
+## 总体状态：M1–M4 里程碑完成，M5 数据权利与 Worker 进行中
 
 ```
 里程碑完成度：
@@ -8,7 +8,7 @@
 ▓▓▓▓▓▓▓▓▓▓ M2 账户与工作空间  ✅ (E02-T01~T07 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M3 手动经营闭环     ✅ (E03-T01~T06 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M4 AI COO           ✅ (E04-T01~T07 全部完成)
-░░░░░░░░░░ M5 数据权利与Worker  📋 (未开始)
+▓▓▓▓▓▓▓▓░░ M5 数据权利与Worker  🚧 (E05-T01~T03 完成；E05-T04 待特权部署)
 ░░░░░░░░░░ M6 发布候选         📋 (未开始)
 ```
 
@@ -30,7 +30,7 @@
 
 > 注：`0005`/`0006` 刻意不使用 `CREATE OR REPLACE FUNCTION`，因此普通本地迁移账号（无 `public` schema `CREATE` 权限）也能直接 `pnpm db migrate` 成功应用。
 
-### API（项目、任务、进度与 CRM-lite、仪表盘、AI COO 已接入，43 个测试全部通过）
+### API（项目、任务、进度与 CRM-lite、仪表盘、AI COO、数据导出、注销、Worker 状态已接入，48 个测试全部通过）
 
 | 路由 | 功能 | 关键点 |
 |------|------|--------|
@@ -66,6 +66,15 @@
 | `GET /api/v1/customers/:customerId/stage-history` | 阶段历史 | 只读 append-only 历史、游标分页 |
 | `GET /api/v1/dashboard/daily-top3` | 每日三件事（手动降级） | 当前空间活跃/暂停项目下的活跃任务只读 top-3；排除终态项目/任务；不改任务状态（E03-T05） |
 | `POST /api/v1/dashboard/daily-top3/actions/confirm` | 确认每日 AI 建议排序 | 仅确认原建议的 1–3 项连续排序子集；写决议/审计但不创建或修改任务（E04-T06） |
+| `POST /api/v1/exports` | 申请基础数据 CSV 导出 | 同事务创建 `export_job`、`async_job`、审计与幂等记录；仅当前空间（E05-T01） |
+| `GET /api/v1/exports` / `GET /api/v1/exports/:id` | 查询导出任务 | 仅当前空间；不返回私有 `object_key`（E05-T01） |
+| `POST /api/v1/exports/:id/download-token` | 签发一次性下载令牌 | 仅 `READY`，仅持久化 SHA-256 hash，签发新令牌即撤销旧未消费令牌（E05-T01） |
+| `POST /api/v1/exports/:id/download` | 下载导出 CSV | token 仅 JSON body，认证用户匹配签发用户；同事务消费 token + `DOWNLOADED`，重放 `409`（E05-T01） |
+| `POST /api/v1/deactivation-requests` | 申请注销 | 当前 Session 15 分钟重认证；置用户 `DEACTIVATION_GRACE`/空间 `READ_ONLY`，撤销其他会话并安排最终任务（E05-T03） |
+| `GET /api/v1/deactivation-request` | 查询注销状态 | 返回当前/最近请求、宽限期、保留例外与 tombstone 时间（E05-T03） |
+| `POST /api/v1/deactivation-request/actions/revoke` | 撤销注销 | 仅 `GRACE`、当前 Session 15 分钟重认证；恢复账户/空间并取消未执行最终任务（E05-T03） |
+| `GET /api/v1/async-jobs` | 当前空间异步任务 | 状态过滤/限额列表；仅返回当前 workspace，失败只含稳定码与安全摘要（E05-T04） |
+| `GET /api/v1/async-jobs/summary` | 当前空间队列摘要 | queued/running/retry/dead-letter 计数与最早积压时间，不泄露其他空间任务（E05-T04） |
 | `POST /api/v1/ai/runs` | 创建 AI Run | 受控上下文 + 供应商适配器调用，事务外调用，持久化脱敏快照（E04-T03） |
 | `GET /api/v1/ai/runs/:runId` | AI Run 详情 | 仅当前空间，跨空间 404 |
 | `GET /api/v1/ai/runs/:runId/events` | AI Run SSE 事件流 | 仅安全事件；支持 `Last-Event-ID` 断线恢复（E04-T03） |
@@ -92,13 +101,22 @@
 - **T06 每日三件事 AI 建议与配额**：`DAILY_TOP3` 仅接受最多 3 项 `{taskId,rank,reason}`；`ai_usage_daily` 以 UTC 日期、空间与能力原子计数，每日 3 次配额，超额返回 `429 AI_QUOTA_CAPABILITY_EXHAUSTED` 与 `Retry-After`；仪表盘仅展示请求日期内有效的 AI 建议，否则回退 E03-T05 手动 top-3；确认只记录用户选择的原项子集/连续排序、决议、审计和幂等响应，绝不创建或改变任务。
 - **T07 AI 质量、安全与成本测试集**：版本化 `ai-evaluation-v1` 合成样本与说明文档；任务拆解 100、每日三件事 50、低质量输入 20、Prompt 注入 30、脱敏 30，均有稳定样本 ID 与确定性可重跑断言；注入验证用户输入隔离于 system/context 分区，脱敏验证客户别名、备注/任务描述/邮箱/电话不进入模型上下文；E04-T06 集成用例验证 `ai_usage_daily` 的配额、成功/失败计数与 token 累计。
 
+### 数据权利与 Worker（E05-T01）
+
+- **私有 S3/MinIO 存储**：`S3ExportStorage` 使用受控 endpoint、path-style 与显式凭据；对象始终私有、不生成公开或签名 URL。`EXPORT_S3_*` 均经集中环境校验，密钥不进入仓库/日志。
+- **导出与下载**：仅导出认证用户当前空间的 project/task/customer 基础经营数据；CSV 保留 BOM、字段转义并中和以 `= + - @` 开头的公式注入值；Worker 写私有对象、校验和、大小、7 天到期时间。下载令牌为 32-byte 随机值，仅存 SHA-256 hash，只从签发接口响应一次，不进入 URL、对象键、审计摘要或幂等响应。
+- **Worker 可靠性**：`EXPORT_GENERATE` 以 `FOR UPDATE SKIP LOCKED` 领取作业，`RUNNING→SUCCEEDED` 成功收敛；失败安全记录为 `RETRY_SCHEDULED`，第三次失败进入 `DEAD_LETTER` 与 export `FAILED`，仅记录稳定失败码。
+- **T02 到期导出清理**：Worker 每轮扫描已到期的 `READY`/`DOWNLOADED` 导出，幂等创建 `EXPORT_CLEANUP`；清理任务以 `SKIP LOCKED` 领取，先删除私有对象，再同事务撤销未消费令牌、清空 object key、置 `EXPIRED`、完成作业并追加 Worker 审计。对象删除失败不会提前改变导出状态，作业按最多 3 次重试后进入 `DEAD_LETTER`。
+- **T03 注销与宽限期**：注销申请/撤销均要求当前 Session 15 分钟内重认证，且都具备事务幂等和审计；申请同时置用户 `DEACTIVATION_GRACE`、空间 `READ_ONLY`、撤销其他会话并安排 `DEACTIVATION_FINALIZE`。全局 API 守卫拒绝只读空间的非认证/导出/注销写入；最终 Worker 在宽限期届满且无 retention hold 时锁定任务，禁用凭据、撤销会话、匿名化账号/画像/项目/任务/客户字段，置空间/用户/请求为 `TOMBSTONED`，失败最多重试 3 次后死信。
+- **T04 Worker 可观测性与审计分区维护**：用户仅可读取当前 workspace 的 `async_job` 状态、积压计数与 `failure_code`/`failure_detail_safe`；系统维护任务使用 `workspace_id=NULL + resource_type=system`，迁移约束阻止将其伪造为业务空间任务。Worker 按 UTC 月幂等排程并消费 `AUDIT_PARTITION_MAINTAIN`，失败安全重试/死信。审计分区 DDL 通过 `db/privileged/0007_audit_partition_maintenance.sql` 的 `audit_owner` 专用 `SECURITY DEFINER` 函数执行；普通应用迁移账号被刻意拒绝该权限，需由受控部署流程执行脚本后 Worker 才能成功维护分区。
+
 ### 测试验证
 
 | 命令 | 结果 |
 |------|------|
 | `pnpm.cmd typecheck` | ✅ 6 个工作空间 |
 | `pnpm.cmd lint` | ✅ |
-| `pnpm.cmd test` | ✅ 15 文件 / 43 用例 |
+| `pnpm.cmd test` | ✅ 18 文件 / 48 用例 |
 | `pnpm.cmd build` | ✅ web + api + contracts + config + worker |
 | `GET /health` → 200 | ✅ |
 | `GET /ready` → 200 (db+redis ok) | ✅ |
@@ -118,12 +136,16 @@
 | M3 手动经营闭环 | E03-T01~T06（含每日三件事手动降级、幂等/乐观锁通用用例） | ✅ 全部完成 |
 | E04 AI COO | E04-T01 适配器 / T02 受控上下文 / T03 Run·SSE / T04 提案状态机 / T05 建议事务 / T06 每日三件事 AI 建议与配额 / T07 质量安全成本测试集 | ✅ T01~T07 全部完成 |
 
-### 下一阶段：M4 AI COO（收尾）
+### 当前阶段：M5 数据权利 + Worker
 
 | ID | 内容 | 依赖 | 状态 |
 |----|------|------|------|
 | E04-T06 | 每日三件事 AI 建议与配额 | E04-T04、E03-T05 | ✅ 已完成：`DAILY_TOP3` 最多 3 项；`ai_usage_daily` 原子 UTC 日配额与 `429`；当日 AI 建议或 E03-T05 手动降级；确认仅记录排序、不修改任务 |
 | E04-T07 | AI 质量、安全、成本测试集 | E04-T04~T06 | ✅ 已完成：版本化 `ai-evaluation-v1`，任务拆解 100、每日三件事 50、低质量输入 20、注入 30、脱敏 30；确定性可重跑，配额/token 成本投影由真实数据库集成测试覆盖 |
+| E05-T01 | 数据导出、CSV 与一次性下载 | M04 表结构、审计 | ✅ 已完成：S3/MinIO 私有对象存储、`EXPORT_GENERATE` Worker、7 天过期、一次性 hash token、`POST` body 受控下载、重放 `409`、CSV 公式注入防护与集成测试 |
+| E05-T02 | 到期导出对象清理 | E05-T01 | ✅ 已完成：`EXPORT_CLEANUP` 幂等扫描/领取、私有对象删除、未消费 token 撤销、`EXPIRED` 状态与 Worker 审计；失败最多重试 3 次后死信；集成测试覆盖对象删除与重复执行 |
+| E05-T03 | 注销宽限期与匿名化 | E05-T01、会话重认证 | ✅ 已完成：当前 Session 重认证、`GRACE`/`READ_ONLY` 冻结、其他会话撤销、幂等撤销恢复、API 写入守卫与 `DEACTIVATION_FINALIZE` 匿名化 Worker；真实数据库测试覆盖会话隔离与冻结恢复 |
+| E05-T04 | Worker 可观测性与审计分区维护 | E05-T01~T03、M05 审计表 | 🚧 代码/普通迁移已完成：当前空间任务列表/积压摘要/安全死信信息、系统 job scope 与 Worker 月度调度；待受控 `audit_owner` 部署 `db/privileged/0007_audit_partition_maintenance.sql` 后完成分区 DDL 激活 |
 
 ### 后续 Epic
 
@@ -163,4 +185,4 @@
 
 ## 下次开工入口
 
-从 **E05-T01** 开始：实现数据导出申请、CSV 生成和一次性下载。复用 `export_job`、`export_download_token`、`async_job` 与审计设计；仅导出当前空间基础经营数据，令牌不得进入 URL/日志，消费后重放返回 `409`，文件保留 7 天。
+从 **E05-T04 特权部署** 开始：由 `audit_owner` 受控部署角色执行 `db/privileged/0007_audit_partition_maintenance.sql`；验证 `maintain_audit_partitions()` 创建未来 12 个月分区及 `AUDIT_PARTITION_MAINTAIN` Worker 作业成功收敛。随后继续 E05 后续任务。

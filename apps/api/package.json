@@ -12,6 +12,7 @@
     "test": "pnpm --filter @opc/contracts build && pnpm --filter @opc/config build && vitest run"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.864.0",
     "@fastify/cookie": "11.0.2",
     "@fastify/cors": "^10.0.2",
     "@opc/config": "workspace:*",
