@@ -134,3 +134,11 @@ export async function rejectSuggestion(suggestionId: string, input: { expectedVe
     await client.query("INSERT INTO ai_suggestion_decision (id,suggestion_id,decision,actor_user_id,reason) VALUES ($1,$2,'REJECTED',$3,$4)", [randomUUID(), suggestionId, context.userId, reason]); const value = response(updated); await appendAuditEvent(client, { eventId: randomUUID(), occurredAt: new Date(), actorType: "USER", actorId: context.userId, workspaceId: workspace, action: "AI_SUGGESTION_REJECTED", resourceType: "ai_suggestion", resourceId: suggestionId, afterSummary: { status: updated.status }, requestId: context.requestId, traceId: context.traceId, aiRunId: current.ai_run_id, result: "SUCCESS" }); await recordIdempotent(client, context, "ai.suggestion.reject", key, idempotencyInput, suggestionId, value); await client.query("COMMIT"); return value;
   } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
 }
+
+export async function getSuggestion(suggestionId: string, context: Context, pool: Pool) {
+  const workspace = (await pool.query<{ id: string }>("SELECT id FROM workspace WHERE owner_user_id=$1", [context.userId])).rows[0]?.id;
+  if (!workspace) throw new ApiError(404, "RESOURCE_NOT_FOUND", "当前账户尚未创建工作空间。");
+  const row = (await pool.query<SuggestionRow>("SELECT * FROM ai_suggestion WHERE id=$1 AND workspace_id=$2", [suggestionId, workspace])).rows[0];
+  if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "当前工作空间中不存在该 AI 建议。");
+  return response(row);
+}

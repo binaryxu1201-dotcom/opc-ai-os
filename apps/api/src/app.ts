@@ -21,7 +21,7 @@ import { changeCustomerStage, createCustomer, getCustomer, listCustomers, listCu
 import { getDailyTop3 } from "./dashboard/service.js";
 import { AiProviderAdapter, MockAiProvider } from "./ai/provider.js";
 import { aiRunEvents, createAiRun, getAiRun } from "./ai/run.js";
-import { confirmDailyTop3Suggestion, confirmSuggestion, editSuggestion, rejectSuggestion } from "./ai/suggestion.js";
+import { confirmDailyTop3Suggestion, confirmSuggestion, editSuggestion, getSuggestion, rejectSuggestion } from "./ai/suggestion.js";
 import { S3ExportStorage } from "./export/storage.js";
 import { downloadExport, getExport, issueDownloadToken, listExports, requestExport } from "./export/service.js";
 import { getDeactivation, requestDeactivation, revokeDeactivation } from "./deactivation/service.js";
@@ -177,8 +177,14 @@ export function buildApp(environment: Environment, dependencies = createReadines
   app.post<{ Body: { expectedVersion: number } }>("/api/v1/deactivation-request/actions/revoke", async (request) => ({ data: await revokeDeactivation(request.body.expectedVersion, idempotencyKey(request), await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
   app.get<{ Querystring: { status?: string | string[]; limit?: string } }>("/api/v1/async-jobs", async (request) => { const status = request.query.status === undefined ? undefined : Array.isArray(request.query.status) ? request.query.status : [request.query.status]; const input = { ...(status === undefined ? {} : { status }), ...(request.query.limit === undefined ? {} : { limit: Number(request.query.limit) }) }; return { data: await listAsyncJobs(input, await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }; });
   app.get("/api/v1/async-jobs/summary", async (request) => ({ data: await getAsyncJobSummary(await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }));
+  const requirePlatformOperator = () => { throw new ApiError(403, "OPERATOR_AUTH_REQUIRED", "运营入口需要独立的 platform_operator 身份和 MFA。普通用户会话不能访问。") };
+  app.get("/api/v1/operations/metrics/funnel", async () => requirePlatformOperator());
+  app.get("/api/v1/operations/metrics/ai", async () => requirePlatformOperator());
+  app.get("/api/v1/operations/users/search", async () => requirePlatformOperator());
+  app.put("/api/v1/operations/ai-quotas/users/:userId", async () => requirePlatformOperator());
   app.get<{ Querystring: { date?: string } }>("/api/v1/dashboard/daily-top3", async (request) => ({ data: await getDailyTop3(request.query.date === undefined ? {} : { date: request.query.date }, await authContext(request), workspaceDependencies), meta: { requestId: request.id } }));
   app.post<{ Body: { suggestionId: string; expectedVersion: number; items: { taskId: string; rank: number }[] } }>("/api/v1/dashboard/daily-top3/actions/confirm", async (request) => ({ data: await confirmDailyTop3Suggestion(request.body.suggestionId, { expectedVersion: request.body.expectedVersion, items: request.body.items }, idempotencyKey(request), await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }));
+  app.get<{ Params: { suggestionId: string } }>("/api/v1/ai/suggestions/:suggestionId", async (request) => ({ data: await getSuggestion(request.params.suggestionId, await authContext(request), registrationDependencies.pool), meta: { requestId: request.id } }));
   app.post<{ Body: { capability: "TASK_BREAKDOWN" | "DAILY_TOP3"; projectId?: string; input?: { instruction?: string } } }>("/api/v1/ai/runs", async (request, reply) => {
     if (!request.headers.accept?.includes("text/event-stream")) throw new ApiError(422, "VALIDATION_FAILED", "AI 请求必须接受 text/event-stream 响应。");
     const run = await createAiRun({ capability: request.body.capability, ...(request.body.projectId === undefined ? {} : { projectId: request.body.projectId }), ...(request.body.input?.instruction === undefined ? {} : { instruction: request.body.input.instruction }) }, idempotencyKey(request), await authContext(request), aiDependencies);

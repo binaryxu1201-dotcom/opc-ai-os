@@ -1,6 +1,6 @@
 # 工作检查点 — 2026-07-16
 
-## 总体状态：M1–M4 里程碑完成，M5 数据权利与 Worker 进行中
+## 总体状态：M1–M5 里程碑完成，M6 发布候选与 E06 Web PWA 进行中
 
 ```
 里程碑完成度：
@@ -136,7 +136,7 @@
 | M3 手动经营闭环 | E03-T01~T06（含每日三件事手动降级、幂等/乐观锁通用用例） | ✅ 全部完成 |
 | E04 AI COO | E04-T01 适配器 / T02 受控上下文 / T03 Run·SSE / T04 提案状态机 / T05 建议事务 / T06 每日三件事 AI 建议与配额 / T07 质量安全成本测试集 | ✅ T01~T07 全部完成 |
 
-### 当前阶段：M5 数据权利 + Worker
+### 当前阶段：E06 Web PWA 与运营界面（主线优先）
 
 | ID | 内容 | 依赖 | 状态 |
 |----|------|------|------|
@@ -146,6 +146,12 @@
 | E05-T02 | 到期导出对象清理 | E05-T01 | ✅ 已完成：`EXPORT_CLEANUP` 幂等扫描/领取、私有对象删除、未消费 token 撤销、`EXPIRED` 状态与 Worker 审计；失败最多重试 3 次后死信；集成测试覆盖对象删除与重复执行 |
 | E05-T03 | 注销宽限期与匿名化 | E05-T01、会话重认证 | ✅ 已完成：当前 Session 重认证、`GRACE`/`READ_ONLY` 冻结、其他会话撤销、幂等撤销恢复、API 写入守卫与 `DEACTIVATION_FINALIZE` 匿名化 Worker；真实数据库测试覆盖会话隔离与冻结恢复 |
 | E05-T04 | Worker 可观测性与审计分区维护 | E05-T01~T03、M05 审计表 | ✅ 已完成：当前空间任务列表/积压摘要/安全死信信息、系统 job scope 与 Worker 月度调度；`audit_owner` 已部署 `db/privileged/0007_audit_partition_maintenance.sql`，`maintain_audit_partitions()` 预建 2026-07~2027-07 共 13 个分区，`AUDIT_PARTITION_MAINTAIN` Worker 收敛为 `SUCCEEDED` |
+| E06-T01 | 认证、引导、设置与前端基础设施 | E02-T01~T06 | ✅ 已完成首版：Next.js App Router 页面壳、内存 Access Token API 客户端、Refresh Cookie 恢复、注册/登录、工作空间、画像、可选授权、设置与重认证基础交互；Web typecheck/lint/build 通过 |
+| E06-T02 | 工作台、项目、三级任务和客户页面 | E03-T01~T05 | ✅ 已完成首版：工作台手动降级今日重点、项目列表/详情/创建编辑/状态动作、三级任务树/创建编辑/状态动作、客户列表/详情/创建编辑/阶段矩阵与历史；写入复用幂等键，Web typecheck/lint/build 通过 |
+| E06-T03 | AI 建议和 SSE 交互 | E04-T03~T06 | ✅ 已完成首版：项目任务拆解与每日三件事生成入口、SSE 事件状态/断线流式读取、建议详情、任务建议编辑/确认/驳回、每日三件事确认、授权/失败/降级/澄清/终态按钮边界；新增 workspace-scoped 建议查询 API；API/Web typecheck、lint、build 通过 |
+| E06-T04 | 导出、注销和只读体验 | E05-T01~T04 | ✅ 已完成首版：导出申请/状态查询/一次性 POST body 下载、注销后果说明/重认证/GRACE/撤销/留存提示/TOMBSTONED 状态、设置入口与全局 READ_ONLY 横幅；API/Web typecheck、lint、build 通过 |
+| E06-T05 | 运营聚合和 AI 配额页面 | E01-T06、E04-T06 | 🚧 前端与安全边界已完成首版：独立 `/operations`、聚合指标、掩码用户搜索和配额配置页面；后端 `/operations/*` 当前默认拒绝普通用户会话，待独立 `platform_operator + MFA` 认证与真实聚合服务接入后激活；API/Web typecheck、lint、build 通过 |
+| E06-T06 | PWA、响应式和无障碍 | E06-T01~T05 | ✅ 已完成首版：manifest、SVG 图标、生产 service worker shell、360/768/1440 响应式断点、44px 触控目标、跳过导航、focus-visible、错误状态基础语义、减少动效和 service worker 静态语法检查；Web typecheck/lint/build 通过 |
 
 ### 后续 Epic
 
@@ -185,7 +191,9 @@
 
 ## 下次开工入口
 
-**M5 已完成**（E05-T01~T04 全部交付并通过验证，含 `audit_owner` 特权部署审计分区函数）。下一步进入 **M6 发布候选** 与 **E06 Web PWA**：
+**M5 已完成**（E05-T01~T04 全部交付并通过验证，含 `audit_owner` 特权部署审计分区函数）。E06-T01~T06 首版已完成，下一步进入 **M6 发布候选门禁**；E06-T05 的真实运营接口仍需独立 `platform_operator + MFA` 认证链路和聚合服务实现：
+- E06-T02：工作台、项目、三级任务和客户页面已接入真实 API，完成手动经营主线；覆盖加载、空、错误和服务端状态动作。
+- E06-T03：AI 任务拆解与每日三件事接入真实 SSE/API；E06-T04 已补齐导出/注销体验；E06-T05 已完成安全拒绝边界和前端页面，待运营身份基础设施后激活；E06-T06 已完成 PWA/响应式/无障碍首版，现进入 M6 全量门禁。
 - M6：E2E、安全扫描、性能验证、发布证据（参考 `docs/07-V1-A测试与发布计划.md` 与跨阶段遗留项：10 万条审计事件预发性能验证、Docker/Testcontainers CI、Playwright/axe-core、OpenTelemetry 监控）。
 - E06：React 全部前端页面（依赖 E02~E05 已完成的后端契约）。
 - 跨阶段遗留项中的「审计分区维护 Worker + 13 个月热数据归档策略」已随 E05-T04 落地；其余遗留项归入 M6/M7 收尾。
