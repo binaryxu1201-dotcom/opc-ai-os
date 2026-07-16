@@ -1,6 +1,6 @@
 # 工作检查点 — 2026-07-16
 
-## 总体状态：M1–M5 里程碑完成，M6 发布候选与 E06 Web PWA 进行中
+## 总体状态：M1–M5 完成，M6 发布门禁证据已建立（部分门禁待环境/签字）
 
 ```
 里程碑完成度：
@@ -8,8 +8,8 @@
 ▓▓▓▓▓▓▓▓▓▓ M2 账户与工作空间  ✅ (E02-T01~T07 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M3 手动经营闭环     ✅ (E03-T01~T06 全部完成)
 ▓▓▓▓▓▓▓▓▓▓ M4 AI COO           ✅ (E04-T01~T07 全部完成)
- ▓▓▓▓▓▓▓▓▓▓ M5 数据权利与Worker  ✅ (E05-T01~T04 全部完成)
-░░░░░░░░░░ M6 发布候选         📋 (未开始)
+▓▓▓▓▓▓▓▓▓▓ M5 数据权利与Worker  ✅ (E05-T01~T04 全部完成)
+▓▓▓▓▓▓▓▓░ M6 发布候选         🟡 (门禁证据已建：G0/G1/G2/G4后端/G5 实测通过；G3/G6/G8 脚手架+部分；G7/G9 待签字)
 ```
 
 ---
@@ -152,6 +152,23 @@
 | E06-T04 | 导出、注销和只读体验 | E05-T01~T04 | ✅ 已完成首版：导出申请/状态查询/一次性 POST body 下载、注销后果说明/重认证/GRACE/撤销/留存提示/TOMBSTONED 状态、设置入口与全局 READ_ONLY 横幅；API/Web typecheck、lint、build 通过 |
 | E06-T05 | 运营聚合和 AI 配额页面 | E01-T06、E04-T06 | 🚧 前端与安全边界已完成首版：独立 `/operations`、聚合指标、掩码用户搜索和配额配置页面；后端 `/operations/*` 当前默认拒绝普通用户会话，待独立 `platform_operator + MFA` 认证与真实聚合服务接入后激活；API/Web typecheck、lint、build 通过 |
 | E06-T06 | PWA、响应式和无障碍 | E06-T01~T05 | ✅ 已完成首版：manifest、SVG 图标、生产 service worker shell、360/768/1440 响应式断点、44px 触控目标、跳过导航、focus-visible、错误状态基础语义、减少动效和 service worker 静态语法检查；Web typecheck/lint/build 通过 |
+
+### 当前阶段：M6 发布候选门禁（证据驱动）
+
+| 门禁 | 状态 | 关键证据 |
+|------|------|----------|
+| G0 范围冻结 | ✅ 通过 | 30 路由 / 23 表扫描，非目标关键字 0 命中 |
+| G1 代码质量 | ✅ 通过 | typecheck/lint 全绿；52 测试（原 48 + 契约 4）；覆盖率 语句 91% / 分支 66% / 函数 96%（≥60% 门槛已写入 `vitest.config.ts`） |
+| G2 数据与迁移 | ✅ 通过 | `db/M06_MIGRATION_REVIEW.md`：M01–M07 顺序可重复，特权分区维护独立部署 |
+| G3 核心 E2E | 🟡 部分 | `playwright.config.ts` + `e2e/onboarding.spec.ts`（E2E-01/12 骨架）；待 `playwright install` 后跑全 13 旅程 |
+| G4 API/安全 | 🟢 大部分 | 契约/隔离/越权实测通过（API-02/03/04/11 + SEC-03 + AI 注入/脱敏 60 样本）；SAST/SCA 待工具 |
+| G5 AI 质量 | ✅ 通过 | `ai-evaluation-v1.test.ts` 确定性强跑 230 样本（拆解100/每日三件事50/低质量20/注入30/脱敏30），硬失败 0 |
+| G6 性能/可靠 | 🟡 部分 | `load/api-smoke.js`（k6 骨架 + P95/错误率阈值）；降级逻辑已单测；压测+备份恢复待预发 |
+| G7 合规/隐私 | ⚠️ 待签字 | 检查表口径已就绪；运营 MFA 清册 + 留存确认待法务/安全签字 |
+| G8 UX/无障碍 | 🟢 大部分 | 静态 a11y 审计通过（label/aria/对比度/44px/focus/reduced-motion）；`e2e/a11y.spec.ts`（axe wcag2a/aa 基线）；待浏览器全量 |
+| G9 运营就绪 | ⚠️ 待签字 | requestId/traceId 全链路已实现；仪表盘/Runbook/值班表待补 |
+
+> M6 完整证据见 `docs/M6-EVIDENCE.md`。本次 M6 新增：契约测试、覆盖率门槛、Playwright/k6/axe 脚手架、CI 加固（PG+Redis 服务矩阵 + e2e job）、迁移审查记录。
 
 ### 后续 Epic
 
