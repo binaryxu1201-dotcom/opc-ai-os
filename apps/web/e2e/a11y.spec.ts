@@ -8,6 +8,7 @@ import AxeBuilder from "@axe-core/playwright";
 test.describe("G8 无障碍 axe 基线", () => {
   test("dashboard 无 wcag2a/aa 违规", async ({ page }) => {
     await page.goto("/dashboard");
+    await expect(page).toHaveURL(/\/auth\/login/);
     const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa"]).analyze();
     expect(results.violations).toEqual([]);
   });
