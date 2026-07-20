@@ -5,6 +5,8 @@ export class WebApiError extends Error {
 
 type Envelope<T> = { data: T; meta?: { requestId?: string } };
 let accessToken: string | undefined;
+let authGeneration = 0;
+let pendingRefresh: Promise<{ accessToken: string; expiresAt: string }> | undefined;
 const apiBase = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001").replace(/\/$/, "");
 const writes = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
@@ -13,10 +15,21 @@ function errorFrom(value: unknown, status: number): WebApiError {
   if (isRecord(value) && isRecord(value.error) && typeof value.error.code === "string" && typeof value.error.message === "string") return new WebApiError(status, value.error.code, value.error.message, Array.isArray(value.error.details) ? value.error.details.filter(isRecord) : undefined);
   return new WebApiError(status, "DEPENDENCY_UNAVAILABLE", "服务暂时不可用，请稍后重试。");
 }
-function csrfHeaders(method: string): Record<string, string> { return writes.has(method) ? { Origin: window.location.origin, "X-OPC-CSRF": "1" } : {}; }
+function csrfHeaders(method: string): Record<string, string> { return writes.has(method) ? { "X-OPC-CSRF": "1" } : {}; }
 function idempotencyHeaders(): Record<string, string> { return { "Idempotency-Key": crypto.randomUUID() }; }
-export function setAccessToken(token: string | undefined): void { accessToken = token; }
+export function setAccessToken(token: string | undefined): void { authGeneration += 1; accessToken = token; }
 export function hasAccessToken(): boolean { return accessToken !== undefined; }
+
+async function refreshAccessToken(): Promise<{ accessToken: string; expiresAt: string }> {
+  if (pendingRefresh) return pendingRefresh;
+  const generation = authGeneration;
+  pendingRefresh = (async () => {
+    const result = await raw<{ accessToken: string; expiresAt: string }>("/api/v1/auth/refresh", { method: "POST" }, true);
+    if (generation === authGeneration) accessToken = result.accessToken;
+    return result;
+  })();
+  try { return await pendingRefresh; } finally { pendingRefresh = undefined; }
+}
 
 async function raw<T>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
   const method = (init.method ?? "GET").toUpperCase();
@@ -26,7 +39,8 @@ async function raw<T>(path: string, init: RequestInit = {}, retried = false): Pr
   if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
   const response = await fetch(`${apiBase}${path}`, { ...init, method, headers, credentials: "include" });
   if ((response.status === 401 || response.status === 419) && !retried && !path.endsWith("/auth/refresh")) {
-    try { const refreshed = await raw<{ accessToken: string }>("/api/v1/auth/refresh", { method: "POST" }, true); accessToken = refreshed.accessToken; return raw<T>(path, init, true); } catch { accessToken = undefined; }
+    const generation = authGeneration;
+    try { await refreshAccessToken(); return raw<T>(path, init, true); } catch { if (generation === authGeneration) setAccessToken(undefined); }
   }
   if (!response.ok) { let body: unknown; try { body = await response.json(); } catch { body = undefined; } throw errorFrom(body, response.status); }
   if (response.status === 204) return undefined as T;
@@ -36,8 +50,8 @@ async function raw<T>(path: string, init: RequestInit = {}, retried = false): Pr
 }
 export const api = {
   register: (body: { email?: string; phone?: string; password: string; termsVersion: string; privacyVersion: string }) => raw<{ id: string }>("/api/v1/auth/register", { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }),
-  login: async (body: { identifier: string; password: string }) => { const result = await raw<{ accessToken: string; expiresAt: string; user: User }>("/api/v1/auth/login", { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }); accessToken = result.accessToken; return result; },
-  refresh: async () => { const result = await raw<{ accessToken: string; expiresAt: string }>("/api/v1/auth/refresh", { method: "POST" }); accessToken = result.accessToken; return result; },
+  login: async (body: { identifier: string; password: string }) => { const result = await raw<{ accessToken: string; expiresAt: string; user: User }>("/api/v1/auth/login", { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }); setAccessToken(result.accessToken); return result; },
+  refresh: () => refreshAccessToken(),
   reauthenticate: (password: string) => raw<undefined>("/api/v1/auth/re-authenticate", { method: "POST", body: JSON.stringify({ password }), headers: { "Content-Type": "application/json" } }),
   workspace: { get: () => raw<Workspace>("/api/v1/workspace"), create: (body: { name: string; description?: string }) => raw<Workspace>("/api/v1/workspace", { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }) },
   profile: { get: () => raw<ProfileResult>("/api/v1/profile"), put: (body: ProfileInput) => raw<Profile>("/api/v1/profile", { method: "PUT", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }) },
@@ -85,10 +99,10 @@ export type OpsAiMetrics = { window: { startDate: string; endDate: string }; met
 export type OpsUser = { userId: string; emailMasked: string | null; phoneMasked: string | null; status: string };
 export type OpsQuota = { userId: string; capability: string; dailyLimit: number };
 
-async function downloadCsv(id: string, token: string): Promise<Blob> { const headers = new Headers({ Accept: "text/csv", "Content-Type": "application/json", ...idempotencyHeaders(), Origin: window.location.origin, "X-OPC-CSRF": "1" }); if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`); const response = await fetch(`${apiBase}/api/v1/exports/${id}/download`, { method: "POST", headers, credentials: "include", body: JSON.stringify({ token }) }); if (!response.ok) { let value: unknown; try { value = await response.json(); } catch { value = undefined; } throw errorFrom(value, response.status); } return response.blob(); }
+async function downloadCsv(id: string, token: string): Promise<Blob> { const headers = new Headers({ Accept: "text/csv", "Content-Type": "application/json", ...idempotencyHeaders(), "X-OPC-CSRF": "1" }); if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`); const response = await fetch(`${apiBase}/api/v1/exports/${id}/download`, { method: "POST", headers, credentials: "include", body: JSON.stringify({ token }) }); if (!response.ok) { let value: unknown; try { value = await response.json(); } catch { value = undefined; } throw errorFrom(value, response.status); } return response.blob(); }
 
 async function startAiRun(body: { capability: "TASK_BREAKDOWN" | "DAILY_TOP3"; projectId?: string; instruction?: string }, onEvent?: (event: AiStreamEvent) => void): Promise<AiRun> {
-  const headers = new Headers({ Accept: "text/event-stream", "Content-Type": "application/json", ...idempotencyHeaders(), Origin: window.location.origin, "X-OPC-CSRF": "1" });
+  const headers = new Headers({ Accept: "text/event-stream", "Content-Type": "application/json", ...idempotencyHeaders(), "X-OPC-CSRF": "1" });
   if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
   const response = await fetch(`${apiBase}/api/v1/ai/runs`, { method: "POST", headers, credentials: "include", body: JSON.stringify({ capability: body.capability, ...(body.projectId ? { projectId: body.projectId } : {}), ...(body.instruction ? { input: { instruction: body.instruction } } : {}) }) });
   if (!response.ok) { let value: unknown; try { value = await response.json(); } catch { value = undefined; } throw errorFrom(value, response.status); }
