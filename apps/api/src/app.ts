@@ -89,7 +89,7 @@ export function buildApp(environment: Environment, dependencies = createReadines
   });
 
   void app.register(cookie);
-  void app.register(cors, { origin: environment.WEB_ORIGIN });
+  void app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   registerRequestContext(app);
   registerWriteGuard(app, environment.WEB_ORIGIN);
   registerErrorHandler(app);
