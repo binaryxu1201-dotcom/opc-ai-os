@@ -214,3 +214,85 @@
 - M6：E2E、安全扫描、性能验证、发布证据（参考 `docs/07-V1-A测试与发布计划.md` 与跨阶段遗留项：10 万条审计事件预发性能验证、Docker/Testcontainers CI、Playwright/axe-core、OpenTelemetry 监控）。
 - E06：React 全部前端页面（依赖 E02~E05 已完成的后端契约）。
 - 跨阶段遗留项中的「审计分区维护 Worker + 13 个月热数据归档策略」已随 E05-T04 落地；其余遗留项归入 M6/M7 收尾。
+
+---
+
+## 测试执行记录 — 2026-07-19
+
+### 本轮已执行并通过
+
+- 全量 `pnpm.cmd typecheck`：✅ 6 个工作空间通过。
+- 全量 `pnpm.cmd lint`：✅ 通过。
+- `pnpm.cmd --filter @opc/api test`：✅ 19 个测试文件 / 52 个用例全部通过。
+- 全量构建：✅ contracts、config、api、worker、web 均通过。
+- `pnpm.cmd db:migrate`：✅ 通过。
+- API `GET /health`：✅ 200。
+- Playwright Chromium 与 headless shell：✅ 已安装。
+- axe 基线：✅ 桌面 Chromium 2/2、移动 Chromium 2/2（dashboard、auth/login）。
+- E2E 注册旅程：✅ 桌面/移动通过。
+- E2E 未登录访问保护页跳转：✅ 桌面/移动通过。
+
+### 本轮修复
+
+- `apps/api/src/app.ts`：CORS 启用 `credentials: true`，支持前端 `credentials: "include"` 请求读取响应和 Refresh Cookie。
+- `apps/worker/src/index.ts`：修复可选 S3 endpoint 的严格类型错误；未配置 S3 时进入降级模式。
+- `apps/web/app/lib/api.ts`：移除前端手动设置 `Origin`，保留 `X-OPC-CSRF`，由浏览器生成 Origin。
+- `apps/web/app/lib/auth-context.tsx`：增加 reload 单飞控制；认证页跳过后台 refresh；避免旧 reload 失败清空新 Token。
+- `apps/web/app/components/auth-ui.tsx`：移除登录成功后的冗余 reload，避免会话轮换竞争。
+- `apps/web/e2e/onboarding.spec.ts`：独立测试账号、真实注册登录前置、修正页面 label/按钮定位和导航等待。
+- `apps/web/e2e/a11y.spec.ts`：等待 dashboard 保护页完成跳转后再运行 axe。
+
+### 仍未通过 / 发布阻塞
+
+- **G3 核心 E2E：🟡**。完整 workspace onboarding 旅程在 Playwright 注册→登录→workspace 组合流程中仍存在认证状态竞态，独立浏览器流程可成功；不能以弱化断言或跳过流程替代修复。
+- **G4 API/安全：🟡**。API 契约、隔离、越权和 AI 注入/脱敏回归通过，但公共 npm audit 发现 10 项依赖漏洞：1 critical、4 high、4 moderate、1 low。
+  - `fast-xml-parser@5.2.5`：由 AWS SDK 间接引入，含多项 entity/XML 相关漏洞。
+  - `drizzle-orm@0.39.3`：存在 high SQL identifier 注入漏洞，修复版本为 `>=0.45.2`。
+  - `postcss@8.4.31`：存在 moderate XSS 漏洞。
+  - `uuid@9.0.1`：AWS SDK 间接引入，存在 moderate 漏洞。
+- **G6：🟡**。预发压测、故障注入、备份恢复和迁移回滚尚未执行。
+- **G7：⚠️**。法务/安全签字、运营 MFA 清册和留存期限确认待完成。
+- **G9：⚠️**。仪表盘、Runbook、值班表和告警演练待完成。
+
+### 收工状态
+
+本轮测试产物已清理；未提交或推送代码。工作区保留本轮源代码修改及原有未跟踪 `.devlog.txt`，下次从 G3 workspace onboarding 认证竞态和 G4 依赖升级继续。
+
+---
+
+## 客户分页契约修复记录 — 2026-07-20
+
+### 问题
+
+- 新注册用户进入 `/customers` 时出现 `Cannot read properties of undefined (reading 'length')`。
+- 根因是分页 API 将数组直接放在 `data` 中，而 Web 客户端按 `{ customers, hasMore, nextCursor }` 对象读取；空列表时 `result.customers` 为 `undefined`，页面渲染 `customers.length` 触发异常。
+
+### 本次修改（尚未提交/推送）
+
+- `apps/api/src/app.ts`
+  - 统一项目列表、任务列表、客户列表、客户阶段历史四个 GET 分页接口：完整分页对象放入 `data`，分页字段不再放在 `meta`。
+- `apps/api/test/contract.integration.test.ts`
+  - 增加新用户空项目/空客户列表契约回归测试，确保返回稳定的空数组、`hasMore` 和 `nextCursor`。
+
+### 验证
+
+- API typecheck：✅
+- API lint：✅
+- Web typecheck：✅
+- Web lint：✅
+- Web build：✅
+- API contract test：✅ 5/5
+- 人工 Playwright 验证新用户 `/customers`：✅ 显示“还没有客户”，不再出现 Runtime TypeError
+
+### 下次安排
+
+- 继续人工测试客户创建、编辑、阶段变更与阶段历史。
+- 下午统一检查并提交/推送本次 API 契约修复及 `CHECKPOINT.md` 记录；本次暂停前不执行提交或推送。
+
+---
+
+## 待讨论记录 — 2026-07-21
+
+- 真实 AI provider 加载方式待讨论：目标是在服务端接入 Sublyx 这类 OpenAI-compatible gateway（示例 base URL：`https://api.sublyx.org/v1`），让 AI COO 的 `TASK_BREAKDOWN` 与 `DAILY_TOP3` 通过现有 `AiProvider` / `AiProviderAdapter` 受控调用。
+- 待决策点：配置项命名与 `mock` / `openai-compatible` 切换、模型名与 prompt 版本来源、是否只做服务端 env/KMS 注入或后续开发 `platform_operator + MFA` 运行时配置界面、真实供应商合同/安全/法务确认、CI 不中打真实 provider 的测试策略。
+- 已确认边界：API Key 仅在服务端环境/密钥系统处理；不得进入前端、Git、日志、SSE 事件、`ai_run` 输入/输出摘要或审计摘要；现有授权 `AI_BUSINESS_DATA`、脱敏、Prompt 分区、稳定错误码与每日三件事配额不得被绕过。
