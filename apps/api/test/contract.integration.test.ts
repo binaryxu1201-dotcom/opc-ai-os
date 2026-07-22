@@ -116,4 +116,26 @@ describe("M6 API contract and security regression", () => {
       await pool.query("DELETE FROM app_user WHERE id=$1", [a.userId]);
     }
   });
+
+  it("returns empty paginated collections inside the data envelope", async () => {
+    const a = await makeUser(`empty-${randomUUID()}`);
+    try {
+      const app = buildApp(environment, dependencies);
+      const customers = await app.inject({ method: "GET", url: "/api/v1/customers?limit=100", headers: { authorization: `Bearer ${a.accessToken}` } });
+      expect(customers.statusCode).toBe(200);
+      expect(customers.json().data).toEqual({ customers: [], hasMore: false, nextCursor: null });
+
+      const projects = await app.inject({ method: "GET", url: "/api/v1/projects?limit=50", headers: { authorization: `Bearer ${a.accessToken}` } });
+      expect(projects.statusCode).toBe(200);
+      expect(projects.json().data).toEqual({ projects: [], hasMore: false, nextCursor: null });
+      await app.close();
+    } finally {
+      await pool.query("DELETE FROM consent WHERE workspace_id IN (SELECT id FROM workspace WHERE owner_user_id=$1)", [a.userId]);
+      await pool.query("DELETE FROM workspace WHERE owner_user_id=$1", [a.userId]);
+      await pool.query("DELETE FROM session WHERE user_id=$1", [a.userId]);
+      await pool.query("DELETE FROM credential WHERE user_id=$1", [a.userId]);
+      await pool.query("DELETE FROM idempotency_record WHERE actor_user_id=$1", [a.userId]);
+      await pool.query("DELETE FROM app_user WHERE id=$1", [a.userId]);
+    }
+  });
 });
